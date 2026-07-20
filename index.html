@@ -3,6 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>新丝路会展运营管理平台 V9</title>
 <style>
 /* ========== CSS Variables ========== */
@@ -462,20 +465,3375 @@ select.form-input { cursor: pointer; appearance: none; background: white url("da
 </div>
 <div id="toast-container"></div>
 
-<!-- Database Layer -->
-<script src="src/js/db.js"></script>
-<!-- Data Import -->
-<script src="src/js/data-import.js"></script>
-<!-- Modules -->
-<script src="src/js/modules/dashboard.js"></script>
-<script src="src/js/modules/companies.js"></script>
-<script src="src/js/modules/projects.js"></script>
-<script src="src/js/modules/project-members.js"></script>
-<script src="src/js/modules/contracts.js"></script>
-<script src="src/js/modules/payments.js"></script>
-<script src="src/js/modules/extra.js"></script>
-<!-- Main App -->
-<script src="src/js/app.js"></script>
+<!-- src/js/db.js -->
+<script>
+/**
+ * 新丝路会展运营管理平台 - 数据库层
+ * 使用 IndexedDB 持久化存储，支持离线使用
+ * 对应 V9 schema version 16，共 11 张业务表
+ */
+
+const DB_NAME = 'NSR_EOMP';
+const DB_VERSION = 17; // 递增版本以强制刷新 schema
+
+const STORES = {
+  companies: { keyPath: 'id', indexes: ['companyCn', 'company', 'province', 'city', 'stage', 'priority', 'owner'] },
+  companyUpdates: { keyPath: 'companyId', indexes: ['companyCn', 'stage', 'priority', 'owner', 'contractStatus', 'paymentStatus'] },
+  manualCompanies: { keyPath: 'id', indexes: ['companyCn', 'company'] },
+  projects: { keyPath: 'id', indexes: ['name', 'year', 'status'] },
+  projectMembers: { keyPath: 'id', indexes: ['projectId', 'companyId', 'stage', 'priority', 'owner'] },
+  boothConfirmations: { keyPath: 'id', indexes: ['projectId', 'companyId', 'boothType', 'status'] },
+  contracts: { keyPath: 'id', indexes: ['projectId', 'companyId', 'contractNumber', 'status'] },
+  receivables: { keyPath: 'id', indexes: ['projectId', 'companyId', 'contractId', 'status'] },
+  paymentRecords: { keyPath: 'id', indexes: ['projectId', 'companyId', 'contractId', 'verificationStatus'] },
+  emailLogs: { keyPath: 'id', indexes: ['companyId', 'status'] },
+  todos: { keyPath: 'id', indexes: ['projectId', 'companyId', 'status', 'priority', 'dueDate'] },
+  systemSettings: { keyPath: 'key' },
+  attachments: { keyPath: 'id', indexes: ['companyId', 'projectId', 'category'] }
+};
+
+let db = null;
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+    request.onerror = () => {
+      const err = request.error;
+      console.error('IndexedDB open error:', err);
+      if (err && err.name === 'VersionError') {
+        reject(new Error('数据库版本冲突，请清除浏览器数据后重试'));
+      } else {
+        reject(err);
+      }
+    };
+
+    request.onblocked = () => {
+      reject(new Error('数据库被其他标签页阻塞，请关闭其他标签页后重试'));
+    };
+
+    request.onsuccess = () => {
+      db = request.result;
+      db.onerror = (e) => console.error('IndexedDB runtime error:', e.target.error);
+      resolve(db);
+    };
+
+    request.onupgradeneeded = (e) => {
+      try {
+        const db = e.target.result;
+        const oldVersion = e.oldVersion;
+
+        // 版本升级时彻底重建所有 store，确保 schema 一致
+        if (oldVersion < DB_VERSION) {
+          const existingStores = Array.from(db.objectStoreNames);
+          for (const storeName of existingStores) {
+            try { db.deleteObjectStore(storeName); } catch (_) {}
+          }
+        }
+
+        // 创建所有 store
+        for (const [name, config] of Object.entries(STORES)) {
+          if (!db.objectStoreNames.contains(name)) {
+            const store = db.createObjectStore(name, { keyPath: config.keyPath });
+            for (const idx of config.indexes) {
+              store.createIndex(`by_${idx}`, idx, { unique: false });
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Upgradeneeded error:', err);
+        throw err;
+      }
+    };
+  });
+}
+
+function getStore(storeName, mode = 'readonly') {
+  const tx = db.transaction(storeName, mode);
+  return tx.objectStore(storeName);
+}
+
+// CRUD 操作
+async function getAll(storeName) {
+  return new Promise((resolve, reject) => {
+    const store = getStore(storeName);
+    const request = store.getAll();
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function getById(storeName, id) {
+  return new Promise((resolve, reject) => {
+    const store = getStore(storeName);
+    const request = store.get(id);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function getByIndex(storeName, indexName, value) {
+  return new Promise((resolve, reject) => {
+    const store = getStore(storeName);
+    const index = store.index(`by_${indexName}`);
+    const request = index.getAll(value);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function put(storeName, item) {
+  return new Promise((resolve, reject) => {
+    const store = getStore(storeName, 'readwrite');
+    const request = store.put(item);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function remove(storeName, id) {
+  return new Promise((resolve, reject) => {
+    const store = getStore(storeName, 'readwrite');
+    const request = store.delete(id);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function clearStore(storeName) {
+  return new Promise((resolve, reject) => {
+    const store = getStore(storeName, 'readwrite');
+    const request = store.clear();
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function count(storeName) {
+  return new Promise((resolve, reject) => {
+    const store = getStore(storeName);
+    const request = store.count();
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+// 批量导入
+async function bulkPut(storeName, items) {
+  if (!items || items.length === 0) return 0;
+  return new Promise((resolve, reject) => {
+    const store = getStore(storeName, 'readwrite');
+    let done = 0;
+    for (const item of items) {
+      const req = store.put(item);
+      req.onsuccess = () => {
+        done++;
+        if (done === items.length) resolve(done);
+      };
+      req.onerror = () => reject(req.error);
+    }
+  });
+}
+
+// 获取所有数据统计
+async function getDataStats() {
+  const stats = {};
+  for (const name of Object.keys(STORES)) {
+    stats[name] = await count(name);
+  }
+  return stats;
+}
+
+// 备份 - 导出所有数据
+async function exportAllData() {
+  const data = { exportedAt: new Date().toISOString(), version: DB_VERSION };
+  for (const name of Object.keys(STORES)) {
+    data[name] = await getAll(name);
+  }
+  return data;
+}
+
+// 恢复 - 导入所有数据
+async function importAllData(data, clear = true) {
+  if (clear) {
+    for (const name of Object.keys(STORES)) {
+      await clearStore(name);
+    }
+  }
+  for (const [name, items] of Object.entries(data)) {
+    if (name === 'exportedAt' || name === 'version') continue;
+    if (STORES[name] && Array.isArray(items) && items.length > 0) {
+      await bulkPut(name, items);
+    }
+  }
+}
+
+</script>
+
+<!-- src/js/data-import.js -->
+<script>
+/**
+ * 数据导入模块 - 从V9备份CSV文件导入数据到IndexedDB
+ * 支持：HTTP fetch (开发服务器) 和 文件上传 (file:// 协议)
+ */
+
+// CSV 解析器
+function parseCSV(text) {
+  const lines = [];
+  let current = '';
+  let inQuotes = false;
+  
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '"') { inQuotes = !inQuotes; }
+    else if (ch === '\n' && !inQuotes) { lines.push(current); current = ''; }
+    else if (ch === '\r' && !inQuotes) { /* skip */ }
+    else { current += ch; }
+  }
+  if (current) lines.push(current);
+  if (lines.length === 0) return [];
+  
+  const headers = parseLine(lines[0]);
+  const result = [];
+  for (let i = 1; i < lines.length; i++) {
+    const values = parseLine(lines[i]);
+    const row = {};
+    headers.forEach((h, idx) => {
+      let val = values[idx] || '';
+      if (val && (val.startsWith('{') || val.startsWith('['))) { try { val = JSON.parse(val); } catch(e) {} }
+      if (typeof val === 'string' && !isNaN(val) && val !== '' && !/^\d{4}-\d{2}-\d{2}/.test(val) && !val.startsWith('0')) {
+        const num = Number(val);
+        if (!isNaN(num) && isFinite(num)) val = num;
+      }
+      row[h.trim()] = val;
+    });
+    result.push(row);
+  }
+  return result;
+}
+
+function parseLine(line) {
+  const result = [];
+  let current = '', inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') { inQuotes = !inQuotes; }
+    else if (ch === ',' && !inQuotes) { result.push(current.trim()); current = ''; }
+    else { current += ch; }
+  }
+  result.push(current.trim());
+  return result;
+}
+
+async function importCSVToStore(csvText, storeName, transformFn) {
+  const rows = parseCSV(csvText);
+  if (rows.length > 0) {
+    const firstKey = Object.keys(rows[0])[0];
+    if (firstKey?.charCodeAt(0) === 65279) {
+      const newKey = firstKey.replace(/^\uFEFF/, '');
+      rows.forEach(r => { r[newKey] = r[firstKey]; delete r[firstKey]; });
+    }
+  }
+  
+  const items = rows.map(transformFn || (row => {
+    row.id = String(row.id || Date.now() + Math.random());
+    row.updatedAt = row.updatedAt || new Date().toISOString();
+    return row;
+  }));
+  
+  if (items.length > 0) {
+    await clearStore(storeName);
+    await bulkPut(storeName, items);
+  }
+  return items.length;
+}
+
+// ============ 文件上传导入 ============
+async function importFromFiles(files) {
+  const fileMap = {};
+  for (const file of files) {
+    fileMap[file.name] = file;
+  }
+  
+  let importLog = [];
+  
+  async function processFile(filename, storeName, transformFn) {
+    const file = fileMap[filename];
+    if (!file) return 0;
+    try {
+      const text = await file.text();
+      const count = await importCSVToStore(text, storeName, transformFn);
+      return count;
+    } catch(e) {
+      throw new Error(`导入${filename}失败: ${e.message}`);
+    }
+  }
+
+  // 系统设置
+  try {
+    const count = await processFile('系统设置及业务归属.csv', 'systemSettings', row => ({
+      key: row.key, value: row.value, updatedAt: row.updatedAt || new Date().toISOString()
+    }));
+    importLog.push(`系统设置: ${count} 条`);
+  } catch(e) { importLog.push(e.message); }
+
+  // 企业库
+  try {
+    const count = await processFile('企业库-内置基础数据.csv', 'companies', row => ({
+      id: String(row.id), company: row.company||'', companyCn: row.companyCn||'',
+      booth: row.booth||'', exhibition: row.exhibition||'', province: row.province||'', city: row.city||'',
+      regionType: row.regionType||'', website: row.website||'', email: row.email||'', phone: row.phone||'',
+      contactName: row.contactName||'', contactStatus: row.contactStatus||'', contactSource: row.contactSource||'',
+      years: row.years||'', stage: row.stage||'', priority: row.priority||'', owner: row.owner||'',
+      lastContact: row.lastContact||'', nextFollowUp: row.nextFollowUp||'', intendedArea: row.intendedArea||'',
+      notes: row.notes||'', hasGuangdongAffiliate: row.hasGuangdongAffiliate||false,
+      exhibitions: row.exhibitions||'', officialProfileUrl: row.officialProfileUrl||'',
+      officialAddress: row.officialAddress||'', productGroups: row.productGroups||'',
+      contactEmail: row.contactEmail||'', contactPhone: row.contactPhone||'', profileExtra: row.profileExtra||'',
+      updatedAt: new Date().toISOString()
+    }));
+    importLog.push(`企业库: ${count} 条`);
+  } catch(e) { importLog.push(e.message); }
+
+  // 企业补充资料
+  try {
+    const count = await processFile('企业补充资料.csv', 'companyUpdates', row => ({
+      companyId: String(row.companyId), companyCn: row.companyCn||'',
+      website: row.website||'', contactStatus: row.contactStatus||'', contactSource: row.contactSource||'',
+      industry: row.industry||'', industryTags: row.industryTags||'', stage: row.stage||'', priority: row.priority||'',
+      owner: row.owner||'', contactName: row.contactName||'', contactPhone: row.contactPhone||'', contactEmail: row.contactEmail||'',
+      intendedArea: row.intendedArea||'', intentionType: row.intentionType||'', lastContact: row.lastContact||'',
+      nextFollowUp: row.nextFollowUp||'', notes: row.notes||'', contractStatus: row.contractStatus||'',
+      contractNumber: row.contractNumber||'', contractAmount: row.contractAmount||'',
+      depositAmount: row.depositAmount||'', depositPaidDate: row.depositPaidDate||'',
+      applicationStatus: row.applicationStatus||'', balanceAmount: row.balanceAmount||'',
+      balanceDueDate: row.balanceDueDate||'', paymentStatus: row.paymentStatus||'', contractNotes: row.contractNotes||'',
+      profileExtra: row.profileExtra||'', updatedAt: row.updatedAt||new Date().toISOString()
+    }));
+    importLog.push(`企业补充资料: ${count} 条`);
+  } catch(e) { importLog.push(e.message); }
+
+  // 人工新增企业
+  try { const c = await processFile('人工新增企业.csv', 'manualCompanies', row => ({
+    id: String(row.id), normalizedName: row.normalizedName||'', company: row.company||'',
+    companyCn: row.companyCn||'', payload: row.payload||{}, createdAt: row.createdAt||new Date().toISOString(),
+    updatedAt: row.updatedAt||new Date().toISOString()
+  })); importLog.push(`人工新增: ${c} 条`); } catch(e) { importLog.push(e.message); }
+
+  // 项目资料
+  try {
+    const count = await processFile('项目资料.csv', 'projects', row => {
+      let pc = {}; try { pc = typeof row.profitConfig==='string'?JSON.parse(row.profitConfig):(row.profitConfig||{}); } catch(e) {}
+      let sr = []; try { sr = typeof row.subsidyRequirements==='string'?JSON.parse(row.subsidyRequirements):(row.subsidyRequirements||[]); } catch(e) {}
+      return {
+        id: String(row.id), name: row.name||'', englishName: row.englishName||'', sortOrder: row.sortOrder||0,
+        year: row.year||'', industry: row.industry||'', location: row.location||'',
+        startDate: row.startDate||'', endDate: row.endDate||'', status: row.status||'筹备中',
+        targetBooths: row.targetBooths||'', targetArea: row.targetArea||'',
+        isYuemaoGlobal: row.isYuemaoGlobal === 'true' || row.isYuemaoGlobal === true,
+        subsidyRequirements: sr, isPinned: row.isPinned==='true'||row.isPinned===true,
+        archivedAt: row.archivedAt||'', profitConfig: pc, notes: row.notes||'',
+        createdAt: row.createdAt||new Date().toISOString(), updatedAt: row.updatedAt||new Date().toISOString()
+      };
+    });
+    importLog.push(`项目资料: ${count} 条`);
+  } catch(e) { importLog.push(e.message); }
+
+  // 项目企业业务档案
+  try {
+    const count = await processFile('企业项目业务档案.csv', 'projectMembers', row => {
+      let idata={}; try{idata=typeof row.intentionData==='string'?JSON.parse(row.intentionData):(row.intentionData||{});}catch(e){}
+      let fups=[]; try{fups=typeof row.followUps==='string'?JSON.parse(row.followUps):(row.followUps||[]);}catch(e){}
+      let pms=[]; try{pms=typeof row.payments==='string'?JSON.parse(row.payments):(row.payments||[]);}catch(e){}
+      let bts=[]; try{bts=typeof row.booths==='string'?JSON.parse(row.booths):(row.booths||[]);}catch(e){}
+      let pd={}; try{pd=typeof row.profitData==='string'?JSON.parse(row.profitData):(row.profitData||{});}catch(e){}
+      let cd={}; try{cd=typeof row.contractData==='string'?JSON.parse(row.contractData):(row.contractData||{});}catch(e){}
+      return {
+        id: String(row.id||Date.now()+Math.random()), projectId: String(row.projectId), companyId: String(row.companyId),
+        stage: row.stage||'', priority: row.priority||'', owner: row.owner||'', businessOwner: row.businessOwner||row.owner||'',
+        intentionType: row.intentionType||'', intendedArea: row.intendedArea||'', intendedBoothType: row.intendedBoothType||row.boothType||'',
+        intendedBoothCount: row.intendedBoothCount||0, nextFollowUp: row.nextFollowUp||'', notes: row.notes||'',
+        contractStatus: row.contractStatus||'未签订', contractNumber: row.contractNumber||'', contractAmount: row.contractAmount||0,
+        depositAmount: row.depositAmount||0, depositPaidDate: row.depositPaidDate||'', balanceAmount: row.balanceAmount||0,
+        balanceDueDate: row.balanceDueDate||'', paymentStatus: row.paymentStatus||'未收款', contractNotes: row.contractNotes||'',
+        boothType: row.boothType||'', boothMaterials: typeof row.boothMaterials==='string'?JSON.parse(row.boothMaterials||'{}'):(row.boothMaterials||{}),
+        subsidyMaterials: typeof row.subsidyMaterials==='string'?JSON.parse(row.subsidyMaterials||'{}'):(row.subsidyMaterials||{}),
+        rentals: typeof row.rentals==='string'?JSON.parse(row.rentals||'[]'):(row.rentals||[]),
+        isGroupTour: row.isGroupTour==='true'||row.isGroupTour===true,
+        groupTravel: typeof row.groupTravel==='string'?JSON.parse(row.groupTravel||'{}'):(row.groupTravel||{}),
+        intentionData: idata, followUps: fups, payments: pms, booths: bts,
+        executionUnlocked: row.executionUnlocked==='true'||row.executionUnlocked===true,
+        subsidyEnabled: row.subsidyEnabled==='true'||row.subsidyEnabled===true,
+        profitData: pd, contractData: cd, updatedAt: row.updatedAt||new Date().toISOString()
+      };
+    });
+    importLog.push(`企业项目档案: ${count} 条`);
+  } catch(e) { importLog.push(e.message); }
+
+  // 确认展位
+  try {
+    const count = await processFile('确认展位.csv', 'boothConfirmations', row => ({
+      id: String(row.id||Date.now()+Math.random()), projectId: String(row.projectId), companyId: String(row.companyId),
+      status: row.status||'待确认', boothType: row.boothType||'', area: row.area||'', boothCount: row.boothCount||0,
+      hallNumber: row.hallNumber||'', boothNumber: row.boothNumber||'', openingType: row.openingType||'',
+      locationNotes: row.locationNotes||'', confirmedAt: row.confirmedAt||'', confirmedBy: row.confirmedBy||'',
+      sourceSnapshot: typeof row.sourceSnapshot==='string'?row.sourceSnapshot:JSON.stringify(row.sourceSnapshot||{}),
+      unitPrice: 0, totalPrice: 0, updatedAt: row.updatedAt||new Date().toISOString()
+    }));
+    importLog.push(`确认展位: ${count} 条`);
+  } catch(e) { importLog.push(e.message); }
+
+  // 合同
+  try {
+    const count = await processFile('合同记录.csv', 'contracts', row => ({
+      id: String(row.id), projectId: String(row.projectId), companyId: String(row.companyId),
+      contractNumber: row.contractNumber||'', templateKey: row.templateKey||'', version: row.version||1,
+      status: row.status||'未签订', currency: row.currency||'CNY', boothSubtotal: row.boothSubtotal||0,
+      otherFeeSubtotal: row.otherFeeSubtotal||0, totalAmount: row.totalAmount||0,
+      totalAmountUppercase: row.totalAmountUppercase||'',
+      boothSnapshot: typeof row.boothSnapshot==='string'?row.boothSnapshot:JSON.stringify(row.boothSnapshot||{}),
+      partySnapshot: typeof row.partySnapshot==='string'?row.partySnapshot:JSON.stringify(row.partySnapshot||{}),
+      feeLines: typeof row.feeLines==='string'?row.feeLines:JSON.stringify(row.feeLines||[]),
+      paymentTerms: typeof row.paymentTerms==='string'?row.paymentTerms:JSON.stringify(row.paymentTerms||{}),
+      templateSnapshot: typeof row.templateSnapshot==='string'?row.templateSnapshot:JSON.stringify(row.templateSnapshot||{}),
+      signedAt: row.signedAt||'', createdAt: row.createdAt||new Date().toISOString(),
+      updatedAt: row.updatedAt||new Date().toISOString()
+    }));
+    importLog.push(`合同记录: ${count} 条`);
+  } catch(e) { importLog.push(e.message); }
+
+  // 应收
+  try { const c = await processFile('应收记录.csv', 'receivables', row => ({
+    id: String(row.id), projectId: String(row.projectId), companyId: String(row.companyId),
+    contractId: String(row.contractId||''), category: row.category||'', sourceType: row.sourceType||'',
+    sourceId: row.sourceId||'', title: row.title||'', amount: row.amount||0, dueDate: row.dueDate||'',
+    status: row.status||'未收', notes: row.notes||'', createdAt: row.createdAt||new Date().toISOString(),
+    updatedAt: row.updatedAt||new Date().toISOString()
+  })); importLog.push(`应收记录: ${c} 条`); } catch(e) { importLog.push(e.message); }
+
+  // 付款
+  try { const c = await processFile('实际付款记录.csv', 'paymentRecords', row => ({
+    id: String(row.id), projectId: String(row.projectId), companyId: String(row.companyId),
+    contractId: row.contractId||'', receivableId: row.receivableId||'', amount: row.amount||0,
+    paidAt: row.paidAt||'', category: row.category||'', purpose: row.purpose||'',
+    verificationStatus: row.verificationStatus||'待核对', validityStatus: row.validityStatus||'有效',
+    source: row.source||'', legacyKey: row.legacyKey||'', notes: row.notes||'',
+    createdAt: row.createdAt||new Date().toISOString(), updatedAt: row.updatedAt||new Date().toISOString()
+  })); importLog.push(`付款记录: ${c} 条`); } catch(e) { importLog.push(e.message); }
+
+  // 待办
+  try { const c = await processFile('待办事项.csv', 'todos', row => ({
+    id: String(row.id), projectId: String(row.projectId), companyId: String(row.companyId),
+    title: row.title||'', taskType: row.taskType||'', businessOwner: row.businessOwner||'',
+    dueDate: row.dueDate||'', priority: row.priority||'中', status: row.status||'待处理',
+    source: row.source||'', notes: row.notes||'', createdAt: row.createdAt||new Date().toISOString(),
+    updatedAt: row.updatedAt||new Date().toISOString()
+  })); importLog.push(`待办事项: ${c} 条`); } catch(e) { importLog.push(e.message); }
+
+  // 邮件
+  try { const c = await processFile('邮件记录.csv', 'emailLogs', row => ({
+    id: String(row.id), companyId: String(row.companyId), recipient: row.recipient||'',
+    subject: row.subject||'', body: row.body||'', status: row.status||'', error: row.error||'',
+    sentAt: row.sentAt||'', createdAt: row.createdAt||new Date().toISOString()
+  })); importLog.push(`邮件记录: ${c} 条`); } catch(e) { importLog.push(e.message); }
+
+  return importLog;
+}
+
+// ============ HTTP Fetch 导入 (需要服务器环境) ============
+async function importFromServer() {
+  const backupPath = 'data/backup_v9_20260719/csv';
+  let importLog = [];
+  
+  async function fetchImport(filename, storeName, transformFn) {
+    try {
+      const resp = await fetch(`${backupPath}/${filename}`);
+      const text = await resp.text();
+      const count = await importCSVToStore(text, storeName, transformFn);
+      return count;
+    } catch(e) {
+      throw new Error(`${filename}: ${e.message}`);
+    }
+  }
+
+  try { const c = await fetchImport('系统设置及业务归属.csv', 'systemSettings', r => ({key:r.key,value:r.value,updatedAt:r.updatedAt||now()})); importLog.push(`系统设置: ${c}条`); } catch(e) { importLog.push(e.message); }
+  try { const c = await fetchImport('企业库-内置基础数据.csv', 'companies', r => ({
+    id: String(r.id), company: r.company||'', companyCn: r.companyCn||'', booth: r.booth||'', exhibition: r.exhibition||'', province: r.province||'', city: r.city||'',
+    regionType: r.regionType||'', website: r.website||'', email: r.email||'', phone: r.phone||'', contactName: r.contactName||'',
+    contactStatus: r.contactStatus||'', contactSource: r.contactSource||'', years: r.years||'', stage: r.stage||'', priority: r.priority||'', owner: r.owner||'',
+    lastContact: r.lastContact||'', nextFollowUp: r.nextFollowUp||'', intendedArea: r.intendedArea||'', notes: r.notes||'',
+    hasGuangdongAffiliate: r.hasGuangdongAffiliate||false, exhibitions: r.exhibitions||'', officialProfileUrl: r.officialProfileUrl||'',
+    officialAddress: r.officialAddress||'', productGroups: r.productGroups||'', contactEmail: r.contactEmail||'', contactPhone: r.contactPhone||'',
+    profileExtra: r.profileExtra||'', updatedAt: now()
+  })); importLog.push(`企业库: ${c}条`); } catch(e) { importLog.push(e.message); }
+  
+  // ... remainder same as file import for other categories
+  const importFns = [
+    ['企业补充资料.csv', 'companyUpdates', r => ({
+      companyId: String(r.companyId), companyCn: r.companyCn||'', website: r.website||'', contactStatus: r.contactStatus||'',
+      contactSource: r.contactSource||'', industry: r.industry||'', industryTags: r.industryTags||'', stage: r.stage||'',
+      priority: r.priority||'', owner: r.owner||'', contactName: r.contactName||'', contactPhone: r.contactPhone||'',
+      contactEmail: r.contactEmail||'', intendedArea: r.intendedArea||'', intentionType: r.intentionType||'',
+      lastContact: r.lastContact||'', nextFollowUp: r.nextFollowUp||'', notes: r.notes||'', contractStatus: r.contractStatus||'',
+      contractNumber: r.contractNumber||'', contractAmount: r.contractAmount||'', depositAmount: r.depositAmount||'',
+      depositPaidDate: r.depositPaidDate||'', applicationStatus: r.applicationStatus||'', balanceAmount: r.balanceAmount||'',
+      balanceDueDate: r.balanceDueDate||'', paymentStatus: r.paymentStatus||'', contractNotes: r.contractNotes||'',
+      profileExtra: r.profileExtra||'', updatedAt: r.updatedAt||now()
+    })],
+    ['人工新增企业.csv', 'manualCompanies', r => ({
+      id: String(r.id), normalizedName: r.normalizedName||'', company: r.company||'', companyCn: r.companyCn||'',
+      payload: r.payload||{}, createdAt: r.createdAt||now(), updatedAt: r.updatedAt||now()
+    })],
+    ['项目资料.csv', 'projects', r => {
+      let pc={};try{pc=typeof r.profitConfig==='string'?JSON.parse(r.profitConfig):(r.profitConfig||{});}catch(e){}
+      let sr=[];try{sr=typeof r.subsidyRequirements==='string'?JSON.parse(r.subsidyRequirements):(r.subsidyRequirements||[]);}catch(e){}
+      return {id:String(r.id),name:r.name||'',englishName:r.englishName||'',sortOrder:r.sortOrder||0,year:r.year||'',industry:r.industry||'',location:r.location||'',startDate:r.startDate||'',endDate:r.endDate||'',status:r.status||'筹备中',targetBooths:r.targetBooths||'',targetArea:r.targetArea||'',isYuemaoGlobal:r.isYuemaoGlobal==='true'||r.isYuemaoGlobal===true,subsidyRequirements:sr,isPinned:r.isPinned==='true'||r.isPinned===true,archivedAt:r.archivedAt||'',profitConfig:pc,notes:r.notes||'',createdAt:r.createdAt||now(),updatedAt:r.updatedAt||now()};
+    }],
+    ['企业项目业务档案.csv', 'projectMembers', r => {
+      let idata={},fups=[],pms=[],bts=[],pd={},cd={};
+      try{idata=typeof r.intentionData==='string'?JSON.parse(r.intentionData):(r.intentionData||{});}catch(e){}
+      try{fups=typeof r.followUps==='string'?JSON.parse(r.followUps):(r.followUps||[]);}catch(e){}
+      try{pms=typeof r.payments==='string'?JSON.parse(r.payments):(r.payments||[]);}catch(e){}
+      try{bts=typeof r.booths==='string'?JSON.parse(r.booths):(r.booths||[]);}catch(e){}
+      try{pd=typeof r.profitData==='string'?JSON.parse(r.profitData):(r.profitData||{});}catch(e){}
+      try{cd=typeof r.contractData==='string'?JSON.parse(r.contractData):(r.contractData||{});}catch(e){}
+      return {id:String(r.id||Date.now()+Math.random()),projectId:String(r.projectId),companyId:String(r.companyId),stage:r.stage||'',priority:r.priority||'',owner:r.owner||'',businessOwner:r.businessOwner||r.owner||'',intentionType:r.intentionType||'',intendedArea:r.intendedArea||'',intendedBoothType:r.intendedBoothType||r.boothType||'',intendedBoothCount:r.intendedBoothCount||0,nextFollowUp:r.nextFollowUp||'',notes:r.notes||'',contractStatus:r.contractStatus||'未签订',contractNumber:r.contractNumber||'',contractAmount:r.contractAmount||0,depositAmount:r.depositAmount||0,depositPaidDate:r.depositPaidDate||'',balanceAmount:r.balanceAmount||0,balanceDueDate:r.balanceDueDate||'',paymentStatus:r.paymentStatus||'未收款',contractNotes:r.contractNotes||'',boothType:r.boothType||'',boothMaterials:typeof r.boothMaterials==='string'?JSON.parse(r.boothMaterials||'{}'):(r.boothMaterials||{}),subsidyMaterials:typeof r.subsidyMaterials==='string'?JSON.parse(r.subsidyMaterials||'{}'):(r.subsidyMaterials||{}),rentals:typeof r.rentals==='string'?JSON.parse(r.rentals||'[]'):(r.rentals||[]),isGroupTour:r.isGroupTour==='true'||r.isGroupTour===true,groupTravel:typeof r.groupTravel==='string'?JSON.parse(r.groupTravel||'{}'):(r.groupTravel||{}),intentionData:idata,followUps:fups,payments:pms,booths:bts,executionUnlocked:r.executionUnlocked==='true'||r.executionUnlocked===true,subsidyEnabled:r.subsidyEnabled==='true'||r.subsidyEnabled===true,profitData:pd,contractData:cd,updatedAt:r.updatedAt||now()};
+    }],
+    ['确认展位.csv', 'boothConfirmations', r => ({
+      id:String(r.id||Date.now()+Math.random()),projectId:String(r.projectId),companyId:String(r.companyId),status:r.status||'待确认',boothType:r.boothType||'',area:r.area||'',boothCount:r.boothCount||0,hallNumber:r.hallNumber||'',boothNumber:r.boothNumber||'',openingType:r.openingType||'',locationNotes:r.locationNotes||'',confirmedAt:r.confirmedAt||'',confirmedBy:r.confirmedBy||'',sourceSnapshot:typeof r.sourceSnapshot==='string'?r.sourceSnapshot:JSON.stringify(r.sourceSnapshot||{}),unitPrice:0,totalPrice:0,updatedAt:r.updatedAt||now()
+    })],
+    ['合同记录.csv', 'contracts', r => ({
+      id:String(r.id),projectId:String(r.projectId),companyId:String(r.companyId),contractNumber:r.contractNumber||'',templateKey:r.templateKey||'',version:r.version||1,status:r.status||'未签订',currency:r.currency||'CNY',boothSubtotal:r.boothSubtotal||0,otherFeeSubtotal:r.otherFeeSubtotal||0,totalAmount:r.totalAmount||0,totalAmountUppercase:r.totalAmountUppercase||'',boothSnapshot:typeof r.boothSnapshot==='string'?r.boothSnapshot:JSON.stringify(r.boothSnapshot||{}),partySnapshot:typeof r.partySnapshot==='string'?r.partySnapshot:JSON.stringify(r.partySnapshot||{}),feeLines:typeof r.feeLines==='string'?r.feeLines:JSON.stringify(r.feeLines||[]),paymentTerms:typeof r.paymentTerms==='string'?r.paymentTerms:JSON.stringify(r.paymentTerms||{}),templateSnapshot:typeof r.templateSnapshot==='string'?r.templateSnapshot:JSON.stringify(r.templateSnapshot||{}),signedAt:r.signedAt||'',createdAt:r.createdAt||now(),updatedAt:r.updatedAt||now()
+    })],
+    ['应收记录.csv', 'receivables', r => ({
+      id:String(r.id),projectId:String(r.projectId),companyId:String(r.companyId),contractId:String(r.contractId||''),category:r.category||'',sourceType:r.sourceType||'',sourceId:r.sourceId||'',title:r.title||'',amount:r.amount||0,dueDate:r.dueDate||'',status:r.status||'未收',notes:r.notes||'',createdAt:r.createdAt||now(),updatedAt:r.updatedAt||now()
+    })],
+    ['实际付款记录.csv', 'paymentRecords', r => ({
+      id:String(r.id),projectId:String(r.projectId),companyId:String(r.companyId),contractId:r.contractId||'',receivableId:r.receivableId||'',amount:r.amount||0,paidAt:r.paidAt||'',category:r.category||'',purpose:r.purpose||'',verificationStatus:r.verificationStatus||'待核对',validityStatus:r.validityStatus||'有效',source:r.source||'',legacyKey:r.legacyKey||'',notes:r.notes||'',createdAt:r.createdAt||now(),updatedAt:r.updatedAt||now()
+    })],
+    ['待办事项.csv', 'todos', r => ({
+      id:String(r.id),projectId:String(r.projectId),companyId:String(r.companyId),title:r.title||'',taskType:r.taskType||'',businessOwner:r.businessOwner||'',dueDate:r.dueDate||'',priority:r.priority||'中',status:r.status||'待处理',source:r.source||'',notes:r.notes||'',createdAt:r.createdAt||now(),updatedAt:r.updatedAt||now()
+    })],
+    ['邮件记录.csv', 'emailLogs', r => ({
+      id:String(r.id),companyId:String(r.companyId),recipient:r.recipient||'',subject:r.subject||'',body:r.body||'',status:r.status||'',error:r.error||'',sentAt:r.sentAt||'',createdAt:r.createdAt||now()
+    })],
+  ];
+  
+  for (const [filename, storeName, transformFn] of importFns) {
+    try {
+      const c = await fetchImport(filename, storeName, transformFn);
+      importLog.push(`${filename}: ${c}条`);
+    } catch(e) { importLog.push(e.message); }
+  }
+  
+  return importLog;
+}
+
+</script>
+
+<!-- src/js/modules/dashboard.js -->
+<script>
+/**
+ * 工作台模块 - 统计看板和待办提醒
+ */
+async function renderDashboard() {
+  const companies = await getAll('companies');
+  const projects = await getAll('projects');
+  const members = await getAll('projectMembers');
+  const contracts = await getAll('contracts');
+  const payments = await getAll('paymentRecords');
+  const booths = await getAll('boothConfirmations');
+  const todos = await getAll('todos');
+
+  const activeProjects = projects.filter(p => p.status === '筹备中' || p.status === '进行中');
+  
+  // 待办统计
+  const longNoFollow = members.filter(m => {
+    if (!m.nextFollowUp) return false;
+    const d = new Date(m.nextFollowUp);
+    return !isNaN(d.getTime()) && d < new Date();
+  });
+  
+  let html = `<div class="dashboard">
+    <div class="page-header">
+      <h1>📊 工作台</h1>
+      <span class="text-muted">新丝路会展运营管理平台 V9</span>
+    </div>
+    
+    <div class="stats-grid">
+      <div class="stat-card" onclick="navigateTo('companies')">
+        <div class="stat-value">${companies.length}</div>
+        <div class="stat-label">企业总数</div>
+      </div>
+      <div class="stat-card" onclick="navigateTo('projects')">
+        <div class="stat-value">${activeProjects.length}</div>
+        <div class="stat-label">活跃项目</div>
+      </div>
+      <div class="stat-card" onclick="navigateTo('project-members')">
+        <div class="stat-value">${members.length}</div>
+        <div class="stat-label">企业档案</div>
+      </div>
+      <div class="stat-card" onclick="navigateTo('contracts')">
+        <div class="stat-value">${contracts.length}</div>
+        <div class="stat-label">合同</div>
+      </div>
+      <div class="stat-card" onclick="navigateTo('payments')">
+        <div class="stat-value">${payments.length}</div>
+        <div class="stat-label">付款记录</div>
+      </div>
+      <div class="stat-card" onclick="navigateTo('booths')">
+        <div class="stat-value">${booths.length}</div>
+        <div class="stat-label">确认展位</div>
+      </div>
+    </div>
+    
+    <!-- 待办提醒 -->
+    <div class="dashboard-grid">
+      <div class="dashboard-panel">
+        <h3>🔔 招商待办 (${longNoFollow.length})</h3>
+        <div class="todo-list">
+          ${longNoFollow.length === 0 ? '<p class="text-muted">暂无</p>' : ''}`;
+  
+  for (const m of longNoFollow.slice(0, 10)) {
+    const c = companies.find(c => String(c.id) === String(m.companyId));
+    const p = projects.find(p => String(p.id) === String(m.projectId));
+    html += `<div class="todo-item overdue">
+      <div class="todo-title">${esc(c ? c.companyCn : m.companyId)} - ${esc(p ? p.name : '')}</div>
+      <div class="todo-meta">下次跟进: ${fmtDate(m.nextFollowUp)} | 归属: ${esc(m.owner)}</div>
+    </div>`;
+  }
+  
+  html += `</div></div>
+      <div class="dashboard-panel">
+        <h3>📝 合同待办</h3>
+        <div class="todo-list">`;
+  
+  // 草稿未生成
+  const draftContracts = contracts.filter(c => c.status === '草稿');
+  // 已发送未回签
+  const sentContracts = contracts.filter(c => c.status === '已发送' || c.status === '待回签');
+  // 已签订未收首款（需要实际检查是否有付款记录）
+  const signedNoPayment = contracts.filter(c => {
+    if (c.status !== '已签订') return false;
+    const contractPayments = payments.filter(p => 
+      String(p.companyId) === String(c.companyId) && 
+      String(p.projectId) === String(c.projectId) && 
+      p.validityStatus !== '已作废'
+    );
+    return contractPayments.length === 0;
+  });
+  
+  html += `<div class="todo-item"><span>草稿未生成:</span> <strong>${draftContracts.length}</strong> 份</div>`;
+  html += `<div class="todo-item"><span>已发送未回签:</span> <strong>${sentContracts.length}</strong> 份</div>`;
+  html += `<div class="todo-item"><span>已签订未收首款:</span> <strong>${signedNoPayment.length}</strong> 份</div>`;
+  
+  html += `</div></div>
+      <div class="dashboard-panel">
+        <h3>🏗 展位待办</h3>
+        <div class="todo-list">`;
+  
+  // 已签合同但展位未确认
+  const needConfirmBooths = members.filter(m => 
+    m.contractStatus === '已签订' && (!m.booths || m.booths.length === 0)
+  );
+  
+  html += `<div class="todo-item"><span>待确认展位:</span> <strong>${needConfirmBooths.length}</strong> 个</div>`;
+  
+  html += `</div></div>
+      <div class="dashboard-panel">
+        <h3>📑 补贴待办</h3>
+        <div class="todo-list">`;
+  
+  const subsidyMembers = members.filter(m => m.subsidyEnabled);
+  html += `<div class="todo-item"><span>已申请补贴:</span> <strong>${subsidyMembers.length}</strong> 家</div>`;
+  
+  html += `</div></div>
+    </div>
+    
+    <!-- 项目概览 -->
+    <div class="dashboard-panel">
+      <h3>📋 项目概览</h3>
+      <div class="table-container">
+        <table class="data-table">
+          <thead><tr>
+            <th>项目名称</th><th>年份</th><th>行业</th><th>地点</th><th>状态</th>
+            <th>目标展位</th><th>企业数</th><th>合同数</th>
+          </tr></thead>
+          <tbody>`;
+  
+  for (const p of projects) {
+    const pMembers = members.filter(m => String(m.projectId) === String(p.id));
+    const pContracts = contracts.filter(c => String(c.projectId) === String(p.id));
+    html += `<tr>
+      <td><a href="#" onclick="navigateTo('project-members',{projectId:'${p.id}'});return false">${esc(p.name)}</a></td>
+      <td>${esc(p.year)}</td><td>${esc(p.industry)}</td><td>${esc(p.location)}</td>
+      <td><span class="badge badge-${p.status === '筹备中' ? 'info' : p.status === '进行中' ? 'success' : 'default'}">${esc(p.status)}</span></td>
+      <td>${esc(p.targetBooths)}</td><td>${pMembers.length}</td><td>${pContracts.length}</td>
+    </tr>`;
+  }
+  
+  html += `</tbody></table></div></div>
+  </div>`;
+  
+  return html;
+}
+
+</script>
+
+<!-- src/js/modules/companies.js -->
+<script>
+/**
+ * 企业库模块
+ */
+async function renderCompanies() {
+  const companies = await getAll('companies');
+  const settings = await getAll('systemSettings');
+  const settingsMap = {};
+  settings.forEach(s => settingsMap[s.key] = s.value);
+  
+  const owners = (settingsMap.businessOwners || '新丝路').split('\n').filter(Boolean);
+  
+  let html = `<div class="panel">
+    <div class="panel-header">
+      <h2>🏢 企业库 (${companies.length} 家)</h2>
+      <div class="panel-actions">
+        <button class="btn btn-primary" onclick="showAddCompany()">+ 新增企业</button>
+        <button class="btn btn-sm" onclick="exportCompanies()">导出CSV</button>
+      </div>
+    </div>
+    
+    <!-- 搜索和筛选 -->
+    <div class="filter-bar">
+      <input type="text" id="company-search" class="search-input" placeholder="搜索企业名称/联系人/电话/邮箱..." oninput="filterCompanies()" />
+      <select id="filter-stage" class="filter-select" onchange="filterCompanies()">
+        <option value="">全部阶段</option>
+        <option>新线索</option><option>已联系</option><option>已报价</option><option>已签约</option><option>已完成</option><option>已放弃</option>
+      </select>
+      <select id="filter-owner" class="filter-select" onchange="filterCompanies()">
+        <option value="">全部归属</option>
+        ${owners.map(o => `<option value="${esc(o)}">${esc(o)}</option>`).join('')}
+      </select>
+      <select id="filter-priority" class="filter-select" onchange="filterCompanies()">
+        <option value="">全部优先级</option>
+        <option>高</option><option>中</option><option>低</option>
+      </select>
+      <select id="filter-province" class="filter-select" onchange="filterCompanies()">
+        <option value="">全部地区</option>
+        ${[...new Set(companies.map(c => c.province).filter(Boolean))].sort().map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join('')}
+      </select>
+    </div>
+    
+    <!-- 企业列表 -->
+    <div class="table-container" id="companies-table">
+      ${renderCompanyTable(companies)}
+    </div>
+    
+    <div class="pagination">
+      <span class="text-muted">共 ${companies.length} 家企业</span>
+    </div>
+  </div>`;
+  
+  return html;
+}
+
+function renderCompanyTable(companies) {
+  if (companies.length === 0) {
+    return '<p class="text-muted text-center p-4">暂无企业数据</p>';
+  }
+  
+  return `<table class="data-table">
+    <thead><tr>
+      <th>中文名称</th><th>英文名称</th><th>联系人</th><th>电话</th><th>邮箱</th>
+      <th>地区</th><th>阶段</th><th>优先级</th><th>业务归属</th><th>状态</th><th>操作</th>
+    </tr></thead>
+    <tbody>
+      ${companies.map(c => `<tr>
+        <td class="company-name" onclick="openCompanyDetail('${c.id}')">${esc(c.companyCn)}</td>
+        <td class="text-sm">${esc(c.company)}</td>
+        <td>${esc(c.contactName)}</td>
+        <td>${esc(c.phone)}</td>
+        <td class="text-sm">${esc(c.email)}</td>
+        <td>${esc(c.province || '')} ${esc(c.city || '')}</td>
+        <td><span class="badge">${esc(c.stage || '未设置')}</span></td>
+        <td><span class="badge badge-${c.priority === '高' ? 'danger' : c.priority === '中' ? 'warning' : 'default'}">${esc(c.priority || '-')}</span></td>
+        <td>${esc(c.owner || '-')}</td>
+        <td>${esc(c.contactStatus || '-')}</td>
+        <td class="actions">
+          <button class="btn btn-xs" onclick="editCompany('${c.id}')">编辑</button>
+          <button class="btn btn-xs btn-danger" onclick="deleteCompany('${c.id}')">删除</button>
+        </td>
+      </tr>`).join('')}
+    </tbody>
+  </table>`;
+}
+
+async function filterCompanies() {
+  const query = (document.getElementById('company-search')?.value || '').toLowerCase();
+  const stage = document.getElementById('filter-stage')?.value || '';
+  const owner = document.getElementById('filter-owner')?.value || '';
+  const priority = document.getElementById('filter-priority')?.value || '';
+  const province = document.getElementById('filter-province')?.value || '';
+  
+  const companies = await getAll('companies');
+  let filtered = companies;
+  
+  if (query) {
+    filtered = filtered.filter(c => 
+      (c.companyCn && c.companyCn.toLowerCase().includes(query)) ||
+      (c.company && c.company.toLowerCase().includes(query)) ||
+      (c.contactName && c.contactName.toLowerCase().includes(query)) ||
+      (c.phone && c.phone.toLowerCase().includes(query)) ||
+      (c.email && c.email.toLowerCase().includes(query))
+    );
+  }
+  if (stage) filtered = filtered.filter(c => c.stage === stage);
+  if (owner) filtered = filtered.filter(c => c.owner === owner);
+  if (priority) filtered = filtered.filter(c => c.priority === priority);
+  if (province) filtered = filtered.filter(c => c.province === province);
+  
+  const container = document.getElementById('companies-table');
+  if (container) container.innerHTML = renderCompanyTable(filtered);
+}
+
+function showAddCompany() {
+  showModal('新增企业', `
+    <div class="form-grid">
+      <div class="form-group"><label>中文名称 *</label><input id="f-companyCn" class="form-input" required /></div>
+      <div class="form-group"><label>英文名称</label><input id="f-company" class="form-input" /></div>
+      <div class="form-group"><label>联系人</label><input id="f-contactName" class="form-input" /></div>
+      <div class="form-group"><label>电话</label><input id="f-phone" class="form-input" /></div>
+      <div class="form-group"><label>邮箱</label><input id="f-email" class="form-input" type="email" /></div>
+      <div class="form-group"><label>官网</label><input id="f-website" class="form-input" /></div>
+      <div class="form-group"><label>省份</label><input id="f-province" class="form-input" /></div>
+      <div class="form-group"><label>城市</label><input id="f-city" class="form-input" /></div>
+      <div class="form-group"><label>阶段</label>
+        <select id="f-stage" class="form-input"><option>新线索</option><option>已联系</option><option>已报价</option><option>已签约</option><option>已完成</option><option>已放弃</option></select></div>
+      <div class="form-group"><label>优先级</label>
+        <select id="f-priority" class="form-input"><option>高</option><option>中</option><option>低</option></select></div>
+      <div class="form-group"><label>业务归属</label><input id="f-owner" class="form-input" value="新丝路" /></div>
+      <div class="form-group"><label>来源</label><input id="f-contactSource" class="form-input" /></div>
+      <div class="form-group"><label>地址</label><input id="f-officialAddress" class="form-input" /></div>
+      <div class="form-group full-width"><label>备注</label><textarea id="f-notes" class="form-input" rows="3"></textarea></div>
+    </div>
+  `, async (overlay) => {
+    const companyCn = overlay.querySelector('#f-companyCn').value.trim();
+    if (!companyCn) throw new Error('中文名称必填');
+    
+    const company = {
+      id: generateId(),
+      companyCn,
+      company: overlay.querySelector('#f-company').value.trim(),
+      contactName: overlay.querySelector('#f-contactName').value.trim(),
+      phone: overlay.querySelector('#f-phone').value.trim(),
+      email: overlay.querySelector('#f-email').value.trim(),
+      website: overlay.querySelector('#f-website').value.trim(),
+      province: overlay.querySelector('#f-province').value.trim(),
+      city: overlay.querySelector('#f-city').value.trim(),
+      stage: overlay.querySelector('#f-stage').value,
+      priority: overlay.querySelector('#f-priority').value,
+      owner: overlay.querySelector('#f-owner').value.trim(),
+      contactSource: overlay.querySelector('#f-contactSource').value.trim(),
+      officialAddress: overlay.querySelector('#f-officialAddress').value.trim(),
+      notes: overlay.querySelector('#f-notes').value.trim(),
+      contactStatus: '待联系',
+      booth: '', exhibition: '', regionType: '', years: '',
+      hasGuangdongAffiliate: false, productGroups: '', profileExtra: '',
+      updatedAt: now()
+    };
+    await put('companies', company);
+    navigateTo('companies');
+  });
+}
+
+async function editCompany(companyId) {
+  const company = await getById('companies', companyId);
+  if (!company) { showToast('企业不存在', 'error'); return; }
+  
+  showModal('编辑企业: ' + company.companyCn, `
+    <div class="form-grid">
+      <div class="form-group"><label>中文名称 *</label><input id="f-companyCn" class="form-input" value="${esc(company.companyCn)}" required /></div>
+      <div class="form-group"><label>英文名称</label><input id="f-company" class="form-input" value="${esc(company.company)}" /></div>
+      <div class="form-group"><label>联系人</label><input id="f-contactName" class="form-input" value="${esc(company.contactName)}" /></div>
+      <div class="form-group"><label>电话</label><input id="f-phone" class="form-input" value="${esc(company.phone)}" /></div>
+      <div class="form-group"><label>邮箱</label><input id="f-email" class="form-input" value="${esc(company.email)}" type="email" /></div>
+      <div class="form-group"><label>官网</label><input id="f-website" class="form-input" value="${esc(company.website)}" /></div>
+      <div class="form-group"><label>省份</label><input id="f-province" class="form-input" value="${esc(company.province)}" /></div>
+      <div class="form-group"><label>城市</label><input id="f-city" class="form-input" value="${esc(company.city)}" /></div>
+      <div class="form-group"><label>阶段</label>
+        <select id="f-stage" class="form-input">
+          ${['新线索','已联系','已报价','已签约','已完成','已放弃'].map(s => `<option ${company.stage === s ? 'selected' : ''}>${s}</option>`).join('')}
+        </select></div>
+      <div class="form-group"><label>优先级</label>
+        <select id="f-priority" class="form-input">
+          ${['高','中','低'].map(p => `<option ${company.priority === p ? 'selected' : ''}>${p}</option>`).join('')}
+        </select></div>
+      <div class="form-group"><label>业务归属</label><input id="f-owner" class="form-input" value="${esc(company.owner)}" /></div>
+      <div class="form-group"><label>来源</label><input id="f-contactSource" class="form-input" value="${esc(company.contactSource)}" /></div>
+      <div class="form-group"><label>地址</label><input id="f-officialAddress" class="form-input" value="${esc(company.officialAddress)}" /></div>
+      <div class="form-group full-width"><label>备注</label><textarea id="f-notes" class="form-input" rows="3">${esc(company.notes)}</textarea></div>
+    </div>
+  `, async (overlay) => {
+    company.companyCn = overlay.querySelector('#f-companyCn').value.trim();
+    if (!company.companyCn) throw new Error('中文名称必填');
+    company.company = overlay.querySelector('#f-company').value.trim();
+    company.contactName = overlay.querySelector('#f-contactName').value.trim();
+    company.phone = overlay.querySelector('#f-phone').value.trim();
+    company.email = overlay.querySelector('#f-email').value.trim();
+    company.website = overlay.querySelector('#f-website').value.trim();
+    company.province = overlay.querySelector('#f-province').value.trim();
+    company.city = overlay.querySelector('#f-city').value.trim();
+    company.stage = overlay.querySelector('#f-stage').value;
+    company.priority = overlay.querySelector('#f-priority').value;
+    company.owner = overlay.querySelector('#f-owner').value.trim();
+    company.contactSource = overlay.querySelector('#f-contactSource').value.trim();
+    company.officialAddress = overlay.querySelector('#f-officialAddress').value.trim();
+    company.notes = overlay.querySelector('#f-notes').value.trim();
+    company.updatedAt = now();
+    
+    await put('companies', company);
+    
+    // 同步更新项目档案中的企业基础信息
+    const members = await getByIndex('projectMembers', 'companyId', companyId);
+    for (const member of members) {
+      member.companyCn = company.companyCn;
+      member.updatedAt = now();
+      await put('projectMembers', member);
+    }
+    navigateTo('companies');
+  });
+}
+
+async function deleteCompany(companyId) {
+  const company = await getById('companies', companyId);
+  if (!company) return;
+  
+  if (!confirm(`确定要删除企业"${company.companyCn}"吗？\n\n⚠️ 此操作不可撤销！\n将同时删除该企业的所有项目档案、合同、付款记录和展位信息。\n\n建议将企业标记为"已放弃"而非直接删除。`)) return;
+  
+  // 级联删除项目档案
+  const members = await getByIndex('projectMembers', 'companyId', companyId);
+  for (const member of members) {
+    await remove('projectMembers', member.id);
+  }
+  
+  // 级联删除合同
+  const contracts = await getByIndex('contracts', 'companyId', companyId);
+  for (const contract of contracts) {
+    await remove('contracts', contract.id);
+  }
+  
+  // 级联删除付款记录
+  const payments = await getByIndex('paymentRecords', 'companyId', companyId);
+  for (const payment of payments) {
+    await remove('paymentRecords', payment.id);
+  }
+  
+  // 级联删除展位确认
+  const booths = await getByIndex('boothConfirmations', 'companyId', companyId);
+  for (const booth of booths) {
+    await remove('boothConfirmations', booth.id);
+  }
+  
+  // 最后删除企业本身
+  await remove('companies', companyId);
+  showToast(`已删除企业"${company.companyCn}"及关联的 ${members.length} 条档案、${contracts.length} 份合同、${payments.length} 笔付款、${booths.length} 个展位`, 'warning');
+  navigateTo('companies');
+}
+
+async function exportCompanies() {
+  const companies = await getAll('companies');
+  const headers = ['中文名称','英文名称','联系人','电话','邮箱','省份','城市','阶段','优先级','业务归属','来源','备注'];
+  const rows = companies.map(c => [
+    c.companyCn, c.company, c.contactName, c.phone, c.email,
+    c.province, c.city, c.stage, c.priority, c.owner, c.contactSource, c.notes
+  ]);
+  
+  const csv = [headers.join(',')].concat(rows.map(r => r.map(v => `"${String(v||'').replace(/"/g,'""')}"`).join(','))).join('\n');
+  
+  const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `企业库_${new Date().toISOString().split('T')[0]}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast('导出成功', 'success');
+}
+
+</script>
+
+<!-- src/js/modules/projects.js -->
+<script>
+/**
+ * 项目管理模块
+ */
+async function renderProjects() {
+  const projects = await getAll('projects');
+  
+  let html = `<div class="panel">
+    <div class="panel-header">
+      <h2>📋 项目管理 (${projects.length} 个)</h2>
+      <button class="btn btn-primary" onclick="showAddProject()">+ 新建项目</button>
+    </div>
+    <div class="table-container">
+      <table class="data-table">
+        <thead><tr>
+          <th>项目名称</th><th>英文缩写</th><th>年份</th><th>行业</th><th>地点</th>
+          <th>展期</th><th>状态</th><th>目标展位</th><th>粤贸全球</th><th>操作</th>
+        </tr></thead>
+        <tbody>`;
+  
+  for (const p of projects) {
+    const members = (await getByIndex('projectMembers', 'projectId', String(p.id))) || [];
+    const contracts = (await getByIndex('contracts', 'projectId', String(p.id))) || [];
+    
+    html += `<tr>
+      <td><strong>${esc(p.name)}</strong></td>
+      <td>${esc(p.englishName)}</td>
+      <td>${esc(p.year)}</td>
+      <td>${esc(p.industry)}</td>
+      <td>${esc(p.location)}</td>
+      <td>${fmtDate(p.startDate)} - ${fmtDate(p.endDate)}</td>
+      <td><span class="badge badge-${p.status === '筹备中' ? 'info' : p.status === '进行中' ? 'success' : p.status === '已完成' ? 'primary' : 'default'}">${esc(p.status)}</span></td>
+      <td>${esc(p.targetBooths)}</td>
+      <td>${p.isYuemaoGlobal ? '✅ 是' : '❌ 否'}</td>
+      <td class="actions">
+        <button class="btn btn-xs btn-primary" onclick="navigateTo('project-members',{projectId:'${p.id}'})">企业档案</button>
+        <button class="btn btn-xs" onclick="editProject('${p.id}')">编辑</button>
+        <button class="btn btn-xs" onclick="showProjectProfit('${p.id}')">核算</button>
+      </td>
+    </tr>`;
+  }
+  
+  html += `</tbody></table></div></div>`;
+  return html;
+}
+
+function showAddProject() {
+  showModal('新建项目', `
+    <div class="form-grid">
+      <div class="form-group"><label>项目名称 *</label><input id="f-name" class="form-input" required /></div>
+      <div class="form-group"><label>英文缩写 *</label><input id="f-englishName" class="form-input" placeholder="如: TSEE" required /></div>
+      <div class="form-group"><label>年份</label><input id="f-year" class="form-input" type="number" value="${new Date().getFullYear()+1}" /></div>
+      <div class="form-group"><label>行业</label><input id="f-industry" class="form-input" value="新能源与储能" /></div>
+      <div class="form-group"><label>城市/国家</label><input id="f-location" class="form-input" /></div>
+      <div class="form-group"><label>开始日期</label><input id="f-startDate" class="form-input" type="date" /></div>
+      <div class="form-group"><label>结束日期</label><input id="f-endDate" class="form-input" type="date" /></div>
+      <div class="form-group"><label>目标展位数</label><input id="f-targetBooths" class="form-input" type="number" /></div>
+      <div class="form-group"><label>目标面积(㎡)</label><input id="f-targetArea" class="form-input" type="number" /></div>
+      <div class="form-group"><label>粤贸全球</label>
+        <select id="f-isYuemaoGlobal" class="form-input"><option value="true">是</option><option value="false">否</option></select></div>
+      <div class="form-group full-width"><label>备注</label><textarea id="f-notes" class="form-input" rows="3"></textarea></div>
+    </div>
+  `, async (overlay) => {
+    const name = overlay.querySelector('#f-name').value.trim();
+    if (!name) throw new Error('项目名称必填');
+    const englishName = overlay.querySelector('#f-englishName').value.trim();
+    if (!englishName) throw new Error('英文缩写必填');
+    
+    const project = {
+      id: generateId(),
+      name,
+      englishName,
+      sortOrder: 0,
+      year: overlay.querySelector('#f-year').value,
+      industry: overlay.querySelector('#f-industry').value.trim(),
+      location: overlay.querySelector('#f-location').value.trim(),
+      startDate: overlay.querySelector('#f-startDate').value,
+      endDate: overlay.querySelector('#f-endDate').value,
+      status: '筹备中',
+      targetBooths: overlay.querySelector('#f-targetBooths').value || '',
+      targetArea: overlay.querySelector('#f-targetArea').value || '',
+      isYuemaoGlobal: overlay.querySelector('#f-isYuemaoGlobal').value === 'true',
+      subsidyRequirements: [],
+      isPinned: false,
+      archivedAt: '',
+      profitConfig: {},
+      notes: overlay.querySelector('#f-notes').value.trim(),
+      createdAt: now(),
+      updatedAt: now()
+    };
+    await put('projects', project);
+    navigateTo(AppState.currentTab);
+  });
+  const p = await getById('projects', projectId);
+  if (!p) { showToast('项目不存在', 'error'); return; }
+  
+  showModal('编辑项目', `
+    <div class="form-grid">
+      <div class="form-group"><label>项目名称</label><input id="f-name" class="form-input" value="${esc(p.name)}" /></div>
+      <div class="form-group"><label>英文缩写</label><input id="f-englishName" class="form-input" value="${esc(p.englishName)}" /></div>
+      <div class="form-group"><label>年份</label><input id="f-year" class="form-input" value="${esc(p.year)}" /></div>
+      <div class="form-group"><label>行业</label><input id="f-industry" class="form-input" value="${esc(p.industry)}" /></div>
+      <div class="form-group"><label>地点</label><input id="f-location" class="form-input" value="${esc(p.location)}" /></div>
+      <div class="form-group"><label>开始日期</label><input id="f-startDate" class="form-input" type="date" value="${fmtDate(p.startDate)}" /></div>
+      <div class="form-group"><label>结束日期</label><input id="f-endDate" class="form-input" type="date" value="${fmtDate(p.endDate)}" /></div>
+      <div class="form-group"><label>目标展位</label><input id="f-targetBooths" class="form-input" value="${esc(p.targetBooths)}" /></div>
+      <div class="form-group"><label>目标面积</label><input id="f-targetArea" class="form-input" value="${esc(p.targetArea)}" /></div>
+      <div class="form-group"><label>状态</label>
+        <select id="f-status" class="form-input">
+          <option ${p.status==='筹备中'?'selected':''}>筹备中</option>
+          <option ${p.status==='进行中'?'selected':''}>进行中</option>
+          <option ${p.status==='已完成'?'selected':''}>已完成</option>
+          <option ${p.status==='已归档'?'selected':''}>已归档</option>
+        </select></div>
+      <div class="form-group"><label>粤贸全球</label>
+        <select id="f-isYuemaoGlobal" class="form-input">
+          <option value="true" ${p.isYuemaoGlobal?'selected':''}>是</option>
+          <option value="false" ${!p.isYuemaoGlobal?'selected':''}>否</option>
+        </select></div>
+      <div class="form-group full-width"><label>备注</label><textarea id="f-notes" class="form-input" rows="3">${esc(p.notes)}</textarea></div>
+    </div>
+  `, async (overlay) => {
+    p.name = overlay.querySelector('#f-name').value.trim();
+    p.englishName = overlay.querySelector('#f-englishName').value.trim();
+    p.year = overlay.querySelector('#f-year').value;
+    p.industry = overlay.querySelector('#f-industry').value.trim();
+    p.location = overlay.querySelector('#f-location').value.trim();
+    p.startDate = overlay.querySelector('#f-startDate').value;
+    p.endDate = overlay.querySelector('#f-endDate').value;
+    p.targetBooths = overlay.querySelector('#f-targetBooths').value;
+    p.targetArea = overlay.querySelector('#f-targetArea').value;
+    p.status = overlay.querySelector('#f-status').value;
+    p.isYuemaoGlobal = overlay.querySelector('#f-isYuemaoGlobal').value === 'true';
+    p.notes = overlay.querySelector('#f-notes').value.trim();
+    p.updatedAt = now();
+    await put('projects', p);
+  });
+}
+
+async function showProjectProfit(projectId) {
+  const p = await getById('projects', projectId);
+  if (!p) return;
+  const config = p.profitConfig || {};
+  
+  showModal(`核算方案: ${p.name}`, `
+    <div class="form-grid">
+      <div class="form-group"><label>核算方案</label><input id="f-schemeType" class="form-input" value="${esc(config.schemeType||'')}" /></div>
+      <div class="form-group"><label>独立标准展位/9㎡</label><input id="f-independentPer9" class="form-input" type="number" value="${config.independentPer9||0}" /></div>
+      <div class="form-group"><label>中国区标准展位/9㎡</label><input id="f-groupStandardPer9" class="form-input" type="number" value="${config.groupStandardPer9||0}" /></div>
+      <div class="form-group"><label>空地/㎡</label><input id="f-rawSpacePerSqm" class="form-input" type="number" value="${config.rawSpacePerSqm||0}" /></div>
+      <div class="form-group"><label>报名费默认</label><input id="f-registrationFeeDefault" class="form-input" type="number" value="${config.registrationFeeDefault||2500}" /></div>
+      <div class="form-group"><label>会刊费默认</label><input id="f-catalogueFeeDefault" class="form-input" type="number" value="${config.catalogueFeeDefault||2000}" /></div>
+      <div class="form-group"><label>结算状态</label><input id="f-settlementStatus" class="form-input" value="${esc(config.settlementStatus||'')}" /></div>
+    </div>
+  `, async (overlay) => {
+    p.profitConfig = {
+      ...config,
+      schemeType: overlay.querySelector('#f-schemeType').value.trim(),
+      independentPer9: Number(overlay.querySelector('#f-independentPer9').value) || 0,
+      groupStandardPer9: Number(overlay.querySelector('#f-groupStandardPer9').value) || 0,
+      rawSpacePerSqm: Number(overlay.querySelector('#f-rawSpacePerSqm').value) || 0,
+      registrationFeeDefault: Number(overlay.querySelector('#f-registrationFeeDefault').value) || 2500,
+      catalogueFeeDefault: Number(overlay.querySelector('#f-catalogueFeeDefault').value) || 2000,
+      settlementStatus: overlay.querySelector('#f-settlementStatus').value.trim()
+    };
+    p.updatedAt = now();
+    await put('projects', p);
+  });
+}
+
+</script>
+
+<!-- src/js/modules/project-members.js -->
+<script>
+/**
+ * 企业项目业务档案模块 - 项目级企业档案管理
+ */
+async function renderProjectMembers(params = {}) {
+  const projects = await getAll('projects');
+  const companies = await getAll('companies');
+  
+  let projectId = params.projectId || AppState.currentProjectId;
+  if (!projectId && projects.length > 0) {
+    projectId = String(projects[0].id);
+  }
+  AppState.currentProjectId = projectId;
+  
+  const project = projectId ? await getById('projects', projectId) : null;
+  const members = projectId ? (await getByIndex('projectMembers', 'projectId', projectId) || []) : [];
+  
+  let html = `<div class="panel">
+    <div class="panel-header">
+      <h2>📁 企业项目业务档案</h2>
+      <div class="panel-actions" style="display:flex;gap:8px;align-items:center">
+        <select id="member-project-select" class="filter-select" onchange="navigateTo('project-members',{projectId:this.value})" style="min-width:200px">
+          ${projects.map(p => `<option value="${p.id}" ${String(p.id)===projectId?'selected':''}>${esc(p.name)}</option>`).join('')}
+        </select>
+        ${project ? `<button class="btn btn-primary" onclick="showAddMember('${projectId}')">+ 添加企业到项目</button>` : ''}
+      </div>
+    </div>`;
+  
+  if (!project) {
+    html += '<p class="text-muted p-4">请先创建项目</p></div>';
+    return html;
+  }
+  
+  // 项目下拉
+  html += `<div class="filter-bar">
+    <input type="text" id="member-search" class="search-input" placeholder="搜索企业名称..." oninput="filterMembers()" />
+    <select id="filter-intention" class="filter-select" onchange="filterMembers()">
+      <option value="">全部意向</option>
+      <option>光地展位</option><option>独立标准展位</option><option>中国区标准展位</option><option>联合参展</option><option>其他</option>
+    </select>
+    <select id="filter-contract" class="filter-select" onchange="filterMembers()">
+      <option value="">全部合同状态</option>
+      <option>未签订</option><option>草稿</option><option>待确认</option><option>已生成</option><option>已发送</option><option>待回签</option><option>已签订</option><option>履行中</option><option>已完成</option><option>已取消</option><option>已作废</option>
+    </select>
+    <select id="filter-payment-m" class="filter-select" onchange="filterMembers()">
+      <option value="">全部付款状态</option>
+      <option>未收款</option><option>部分收款</option><option>已收全款</option><option>多收款</option><option>待核对</option><option>已退款</option>
+    </select>
+    <select id="filter-owner-m" class="filter-select" onchange="filterMembers()">
+      <option value="">全部归属</option>
+      ${[...new Set(members.map(m => m.businessOwner || m.owner).filter(Boolean))].sort().map(o => `<option value="${esc(o)}">${esc(o)}</option>`).join('')}
+    </select>
+  </div>`;
+  
+  // 企业列表
+  html += `<div class="table-container" id="members-table">`;
+  html += renderMemberTable(members, companies);
+  html += `</div></div>`;
+  
+  return html;
+}
+
+function renderMemberTable(members, companies) {
+  if (members.length === 0) {
+    return '<p class="text-muted text-center p-4">该项目暂无企业档案。请点击"添加企业到项目"。</p>';
+  }
+  
+  return `<table class="data-table">
+    <thead><tr>
+      <th>企业名称</th><th>意向类型</th><th>意向面积</th><th>合同状态</th><th>付款状态</th>
+      <th>展位类型</th><th>跟团</th><th>补贴</th><th>业务归属</th><th>下次跟进</th><th>操作</th>
+    </tr></thead>
+    <tbody>
+      ${members.map(m => {
+        const c = companies.find(c => String(c.id) === String(m.companyId));
+        const companyName = c ? c.companyCn : (m.companyCn || m.companyId);
+        return `<tr>
+          <td><strong>${esc(companyName)}</strong></td>
+          <td>${esc(m.intentionType || '-')}</td>
+          <td>${m.intendedArea ? m.intendedArea + '㎡' : '-'}</td>
+          <td><span class="badge badge-${getContractStatusClass(m.contractStatus)}">${esc(m.contractStatus||'未签订')}</span></td>
+          <td><span class="badge badge-${getPaymentStatusClass(m.paymentStatus)}">${esc(m.paymentStatus||'未收款')}</span></td>
+          <td>${esc(m.boothType || '-')}</td>
+          <td>${m.isGroupTour ? '✅' : '❌'}</td>
+          <td>${m.subsidyEnabled ? '✅' : '❌'}</td>
+          <td>${esc(m.businessOwner || m.owner || '-')}</td>
+          <td>${fmtDate(m.nextFollowUp)}</td>
+          <td class="actions">
+            <button class="btn btn-xs btn-primary" onclick="openMemberDetail('${m.id}')">详情</button>
+            <button class="btn btn-xs" onclick="editMember('${m.id}')">编辑</button>
+          </td>
+        </tr>`;
+      }).join('')}
+    </tbody>
+  </table>`;
+}
+
+async function filterMembers() {
+  const query = (document.getElementById('member-search')?.value || '').toLowerCase();
+  const intention = document.getElementById('filter-intention')?.value || '';
+  const contract = document.getElementById('filter-contract')?.value || '';
+  const payment = document.getElementById('filter-payment-m')?.value || '';
+  const owner = document.getElementById('filter-owner-m')?.value || '';
+  
+  const members = await getByIndex('projectMembers', 'projectId', AppState.currentProjectId) || [];
+  const companies = await getAll('companies');
+  
+  let filtered = members;
+  if (query) {
+    filtered = filtered.filter(m => {
+      const c = companies.find(c => String(c.id) === String(m.companyId));
+      const name = c ? c.companyCn : (m.companyCn || '');
+      return name.toLowerCase().includes(query);
+    });
+  }
+  if (intention) filtered = filtered.filter(m => m.intentionType === intention);
+  if (contract) filtered = filtered.filter(m => m.contractStatus === contract);
+  if (payment) filtered = filtered.filter(m => m.paymentStatus === payment);
+  if (owner) filtered = filtered.filter(m => (m.businessOwner || m.owner) === owner);
+  
+  const container = document.getElementById('members-table');
+  if (container) container.innerHTML = renderMemberTable(filtered, companies);
+}
+
+async function showAddMember(projectId) {
+  const companies = await getAll('companies');
+  const existingMembers = await getByIndex('projectMembers', 'projectId', projectId) || [];
+  const existingIds = new Set(existingMembers.map(m => String(m.companyId)));
+  const available = companies.filter(c => !existingIds.has(String(c.id)));
+  
+  showModal('添加企业到项目', `
+    <div class="form-group">
+      <label>选择企业 (${available.length} 家可用)</label>
+      <div style="max-height:300px;overflow-y:auto;border:1px solid var(--border);border-radius:4px">
+        ${available.map(c => `
+          <label class="checkbox-row">
+            <input type="checkbox" value="${c.id}" class="member-company-check" />
+            ${esc(c.companyCn)} ${c.contactName ? '- ' + esc(c.contactName) : ''}
+          </label>
+        `).join('')}
+        ${available.length === 0 ? '<p class="text-muted p-2">所有企业已加入项目，或企业库为空</p>' : ''}
+      </div>
+    </div>
+  `, async (overlay) => {
+    const checks = overlay.querySelectorAll('.member-company-check:checked');
+    if (checks.length === 0) throw new Error('请至少选择一家企业');
+    
+    for (const chk of checks) {
+      const companyId = chk.value;
+      const member = {
+        id: generateId(),
+        projectId: projectId,
+        companyId: companyId,
+        stage: '待联系',
+        priority: '中',
+        owner: '新丝路',
+        businessOwner: '新丝路',
+        intentionType: '',
+        intendedArea: '',
+        intendedBoothType: '',
+        intendedBoothCount: 0,
+        nextFollowUp: '',
+        notes: '',
+        contractStatus: '未签订',
+        contractNumber: '',
+        contractAmount: 0,
+        depositAmount: 0,
+        depositPaidDate: '',
+        balanceAmount: 0,
+        balanceDueDate: '',
+        paymentStatus: '未收款',
+        contractNotes: '',
+        boothType: '',
+        boothMaterials: {},
+        subsidyMaterials: {},
+        rentals: [],
+        isGroupTour: false,
+        groupTravel: {},
+        intentionData: {},
+        followUps: [],
+        payments: [],
+        booths: [],
+        executionUnlocked: false,
+        subsidyEnabled: false,
+        profitData: {},
+        contractData: {},
+        updatedAt: now()
+      };
+      await put('projectMembers', member);
+    }
+    navigateTo('project-members', {projectId});
+  });
+}
+
+async function openMemberDetail(memberId) {
+  const member = await getById('projectMembers', memberId);
+  if (!member) { showToast('档案不存在', 'error'); return; }
+  
+  const company = await getById('companies', String(member.companyId));
+  const project = await getById('projects', String(member.projectId));
+  const companyContracts = await getByIndex('contracts', 'companyId', String(member.companyId));
+  const memberContracts = companyContracts.filter(c => String(c.projectId) === String(member.projectId));
+  const payments = await getByIndex('paymentRecords', 'companyId', String(member.companyId));
+  const memberPayments = payments.filter(p => String(p.projectId) === String(member.projectId));
+  const memberBooths = await getByIndex('boothConfirmations', 'companyId', String(member.companyId));
+  
+  let html = `<div class="panel">
+    <div class="panel-header">
+      <h2>📁 ${esc(company ? company.companyCn : member.companyId)}</h2>
+      <div>
+        <button class="btn btn-sm btn-primary" onclick="editMember('${memberId}')">编辑档案</button>
+        <button class="btn btn-sm" onclick="navigateTo('project-members',{projectId:'${member.projectId}'});return false;">返回列表</button>
+      </div>
+    </div>
+    <div class="detail-tabs">
+      <button class="tab-btn active" onclick="switchMemberTab(event,'info')">基本信息</button>
+      <button class="tab-btn" onclick="switchMemberTab(event,'intention')">意向需求</button>
+      <button class="tab-btn" onclick="switchMemberTab(event,'followup')">跟进记录</button>
+      <button class="tab-btn" onclick="switchMemberTab(event,'contracts')">合同</button>
+      <button class="tab-btn" onclick="switchMemberTab(event,'payments')">付款</button>
+      <button class="tab-btn" onclick="switchMemberTab(event,'booths')">展位</button>
+      <button class="tab-btn" onclick="switchMemberTab(event,'rentals')">增租</button>
+      <button class="tab-btn" onclick="switchMemberTab(event,'group-travel')">随团</button>
+      <button class="tab-btn" onclick="switchMemberTab(event,'subsidy')">补贴</button>
+    </div>
+    <div class="tab-content" id="member-tab-content">`;
+  
+  // Info tab
+  html += `<div class="tab-pane active" data-tab="info">
+    <div class="detail-grid">
+      <div class="detail-item"><label>项目</label><span>${esc(project ? project.name : '')}</span></div>
+      <div class="detail-item"><label>企业</label><span>${esc(company ? company.companyCn : '')}</span></div>
+      <div class="detail-item"><label>意向类型</label><span>${esc(member.intentionType)}</span></div>
+      <div class="detail-item"><label>意向面积</label><span>${member.intendedArea || '-'} ㎡</span></div>
+      <div class="detail-item"><label>合同状态</label><span>${esc(member.contractStatus)}</span></div>
+      <div class="detail-item"><label>合同金额</label><span>¥${fmt(member.contractAmount)}</span></div>
+      <div class="detail-item"><label>定金</label><span>¥${fmt(member.depositAmount)}</span></div>
+      <div class="detail-item"><label>付款状态</label><span>${esc(member.paymentStatus)}</span></div>
+      <div class="detail-item"><label>展位类型</label><span>${esc(member.boothType)}</span></div>
+      <div class="detail-item"><label>业务归属</label><span>${esc(member.businessOwner || member.owner)}</span></div>
+      <div class="detail-item"><label>下次跟进</label><span>${fmtDate(member.nextFollowUp)}</span></div>
+      <div class="detail-item"><label>备注</label><span>${esc(member.notes)}</span></div>
+    </div>
+  </div>`;
+  
+  // Intention tab
+  const intentionData = member.intentionData || {};
+  html += `<div class="tab-pane" data-tab="intention">
+    <div class="detail-grid">
+      <div class="detail-item"><label>意向面积</label><span>${member.intendedArea || '-'} ㎡</span></div>
+      <div class="detail-item"><label>意向展位数量</label><span>${member.intendedBoothCount || '-'}</span></div>
+      <div class="detail-item"><label>意向类型</label><span>${esc(member.intentionType)}</span></div>
+      <div class="detail-item"><label>意向馆号</label><span>${esc(intentionData.hall)}</span></div>
+      <div class="detail-item"><label>意向位置</label><span>${esc(intentionData.location)}</span></div>
+      <div class="detail-item"><label>意向开口</label><span>${esc(intentionData.openings)}</span></div>
+      <div class="detail-item"><label>意向价格</label><span>${intentionData.price ? '¥' + fmt(intentionData.price) : '-'}</span></div>
+      <div class="detail-item"><label>是否申请补贴</label><span>${member.subsidyEnabled ? '是' : '否'}</span></div>
+      <div class="detail-item"><label>预计参展人数</label><span>${intentionData.attendees || '-'}</span></div>
+      <div class="detail-item"><label>是否跟团</label><span>${member.isGroupTour ? '是' : '否'}</span></div>
+    </div>
+  </div>`;
+  
+  // Follow-up tab
+  const followUps = member.followUps || [];
+  html += `<div class="tab-pane" data-tab="followup">
+    <button class="btn btn-sm btn-primary mb-2" onclick="addFollowUp('${memberId}')">+ 添加跟进</button>
+    <div class="timeline" id="followup-list">
+      ${followUps.length === 0 ? '<p class="text-muted">暂无跟进记录</p>' : ''}
+      ${followUps.map(f => `
+        <div class="timeline-item">
+          <div class="timeline-date">${fmtDate(f.date)}</div>
+          <div class="timeline-content">
+            <div class="timeline-meta">${esc(f.method||'')} | ${esc(f.person||'')}</div>
+            <p>${esc(f.content)}</p>
+            ${f.nextDate ? `<small>下次跟进: ${fmtDate(f.nextDate)}</small>` : ''}
+            ${f.feedback ? `<small>反馈: ${esc(f.feedback)}</small>` : ''}
+          </div>
+        </div>
+      `).join('')}
+    </div>
+  </div>`;
+  
+  // Contracts tab
+  html += renderContractsTabContent(memberContracts, member);
+  
+  // Payments tab
+  html += renderPaymentsTabContent(memberPayments, member);
+  
+  // Booths tab
+  html += renderBoothsTabContent(memberBooths, member);
+  
+  // Rentals tab
+  html += renderRentalsTabContent(member);
+  
+  // Group travel tab
+  html += renderGroupTravelTabContent(member);
+  
+  // Subsidy tab
+  html += renderSubsidyTabContent(member, project);
+
+  html += `</div></div>`;
+  
+  document.getElementById('content-area').innerHTML = html;
+}
+
+function renderContractsTabContent(contracts, member) {
+  let html = `<div class="tab-pane" data-tab="contracts">
+    <button class="btn btn-sm btn-primary mb-2" onclick="createContract('${member.id}')">+ 创建合同</button>
+    <div class="table-container">`;
+  
+  if (contracts.length === 0) {
+    html += '<p class="text-muted">暂无合同</p>';
+  } else {
+    html += `<table class="data-table">
+      <thead><tr><th>合同编号</th><th>类型</th><th>状态</th><th>金额</th><th>版本</th><th>创建时间</th><th>操作</th></tr></thead>
+      <tbody>`;
+    contracts.forEach(c => {
+      html += `<tr>
+        <td>${esc(c.contractNumber || '-')}</td>
+        <td>${esc(c.templateKey || '-')}</td>
+        <td><span class="badge badge-${getContractStatusClass(c.status)}">${esc(c.status)}</span></td>
+        <td>¥${fmt(c.totalAmount)}</td>
+        <td>${c.version || 1}</td>
+        <td>${fmtDate(c.createdAt)}</td>
+        <td class="actions">
+          <button class="btn btn-xs" onclick="viewContract('${c.id}')">查看</button>
+          <button class="btn btn-xs" onclick="editContract('${c.id}')">编辑</button>
+        </td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+  }
+  
+  html += '</div></div>';
+  return html;
+}
+
+function renderPaymentsTabContent(payments, member) {
+  const totalPaid = payments.filter(p => p.validityStatus !== '已作废').reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+  const contractAmount = Number(member.contractAmount) || 0;
+  const unpaid = Math.max(0, contractAmount - totalPaid);
+  
+  let html = `<div class="tab-pane" data-tab="payments">
+    <div class="payment-summary mb-2">
+      <div class="stat-card small"><div class="stat-value">¥${fmt(contractAmount)}</div><div class="stat-label">合同金额</div></div>
+      <div class="stat-card small"><div class="stat-value">¥${fmt(totalPaid)}</div><div class="stat-label">已收金额</div></div>
+      <div class="stat-card small"><div class="stat-value">¥${fmt(unpaid)}</div><div class="stat-label">未收金额</div></div>
+    </div>
+    <button class="btn btn-sm btn-primary mb-2" onclick="addPayment('${member.id}')">+ 添加付款</button>
+    <div class="table-container">`;
+  
+  if (payments.length === 0) {
+    html += '<p class="text-muted">暂无付款记录</p>';
+  } else {
+    html += `<table class="data-table">
+      <thead><tr><th>日期</th><th>金额</th><th>类型</th><th>用途</th><th>核对状态</th><th>备注</th><th>操作</th></tr></thead>
+      <tbody>`;
+    payments.forEach(p => {
+      html += `<tr>
+        <td>${fmtDate(p.paidAt)}</td>
+        <td>¥${fmt(p.amount)}</td>
+        <td>${esc(p.category || '-')}</td>
+        <td>${esc(p.purpose || '-')}</td>
+        <td><span class="badge">${esc(p.verificationStatus)}</span></td>
+        <td>${esc(p.notes || '')}</td>
+        <td class="actions">
+          <button class="btn btn-xs" onclick="editPayment('${p.id}')">编辑</button>
+          <button class="btn btn-xs btn-danger" onclick="voidPayment('${p.id}')">作废</button>
+        </td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+  }
+  
+  html += '</div></div>';
+  return html;
+}
+
+function renderBoothsTabContent(booths, member) {
+  let html = `<div class="tab-pane" data-tab="booths">
+    <button class="btn btn-sm btn-primary mb-2" onclick="addBooth('${member.id}')">+ 确认展位</button>
+    <div class="table-container">`;
+  
+  if (booths.length === 0) {
+    html += '<p class="text-muted">暂无展位确认记录</p>';
+  } else {
+    html += `<table class="data-table">
+      <thead><tr><th>展位号</th><th>类型</th><th>面积</th><th>数量</th><th>馆号</th><th>开口</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody>`;
+    booths.forEach(b => {
+      html += `<tr>
+        <td>${esc(b.boothNumber || '待分配')}</td>
+        <td>${esc(b.boothType)}</td>
+        <td>${esc(b.area)}</td>
+        <td>${esc(b.boothCount)}</td>
+        <td>${esc(b.hallNumber)}</td>
+        <td>${esc(b.openingType)}</td>
+        <td><span class="badge">${esc(b.status)}</span></td>
+        <td class="actions">
+          <button class="btn btn-xs" onclick="editBooth('${b.id}')">编辑</button>
+        </td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+  }
+  
+  html += '</div></div>';
+  return html;
+}
+
+function renderRentalsTabContent(member) {
+  const rentals = member.rentals || [];
+  let html = `<div class="tab-pane" data-tab="rentals">
+    <button class="btn btn-sm btn-primary mb-2" onclick="addRental('${member.id}')">+ 添加增租</button>
+    <div class="table-container">`;
+  
+  if (rentals.length === 0) {
+    html += '<p class="text-muted">暂无增租记录</p>';
+  } else {
+    html += `<table class="data-table">
+      <thead><tr><th>类别</th><th>规格</th><th>数量</th><th>单价</th><th>总金额</th><th>已收</th><th>未收</th><th>状态</th></tr></thead>
+      <tbody>`;
+    rentals.forEach(r => {
+      html += `<tr>
+        <td>${esc(r.category || '')}</td><td>${esc(r.spec || '')}</td><td>${r.quantity || 0}</td>
+        <td>¥${fmt(r.unitPrice)}</td><td>¥${fmt(r.totalPrice)}</td>
+        <td>¥${fmt(r.paidAmount)}</td><td>¥${fmt((r.totalPrice||0)-(r.paidAmount||0))}</td>
+        <td><span class="badge">${esc(r.paymentStatus || '未收款')}</span></td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+  }
+  
+  html += '</div></div>';
+  return html;
+}
+
+function renderGroupTravelTabContent(member) {
+  const gt = member.groupTravel || {};
+  let html = `<div class="tab-pane" data-tab="group-travel">
+    <div class="detail-grid">
+      <div class="detail-item"><label>是否跟团</label><span>${member.isGroupTour ? '是' : '否'}</span></div>
+      <div class="detail-item"><label>跟团人数</label><span>${gt.count || '-'}</span></div>
+      <div class="detail-item"><label>参展人员</label><span>${esc(gt.participants || '-')}</span></div>
+      <div class="detail-item"><label>护照</label><span>${esc(gt.passport || '-')}</span></div>
+      <div class="detail-item"><label>签证</label><span>${esc(gt.visa || '-')}</span></div>
+      <div class="detail-item"><label>机票</label><span>${esc(gt.flight || '-')}</span></div>
+      <div class="detail-item"><label>酒店</label><span>${esc(gt.hotel || '-')}</span></div>
+      <div class="detail-item"><label>保险</label><span>${esc(gt.insurance || '-')}</span></div>
+      <div class="detail-item"><label>接送机</label><span>${esc(gt.transfer || '-')}</span></div>
+      <div class="detail-item"><label>总费用</label><span>${gt.totalCost ? '¥'+fmt(gt.totalCost) : '-'}</span></div>
+      <div class="detail-item"><label>已收</label><span>${gt.paidAmount ? '¥'+fmt(gt.paidAmount) : '-'}</span></div>
+      <div class="detail-item"><label>未收</label><span>${gt.totalCost ? '¥'+fmt((gt.totalCost||0)-(gt.paidAmount||0)) : '-'}</span></div>
+    </div>
+    <button class="btn btn-sm mt-2" onclick="editGroupTravel('${member.id}')">编辑随团信息</button>
+  </div>`;
+  return html;
+}
+
+function renderSubsidyTabContent(member, project) {
+  const subsidyMaterials = member.subsidyMaterials || {};
+  const requirements = project ? (project.subsidyRequirements || []) : [];
+  
+  let html = `<div class="tab-pane" data-tab="subsidy">
+    <div class="detail-item"><label>是否申请补贴</label><span>${member.subsidyEnabled ? '是' : '否'}</span></div>
+    <h4 class="mt-2">补贴资料清单</h4>
+    <div class="table-container">
+      <table class="data-table">
+        <thead><tr><th>资料名称</th><th>状态</th><th>备注</th></tr></thead>
+        <tbody>`;
+  
+  if (requirements.length === 0) {
+    html += '<tr><td colspan="3" class="text-muted">该项目未配置补贴资料清单</td></tr>';
+  } else {
+    requirements.forEach(req => {
+      const item = subsidyMaterials[req] || {};
+      const status = item.status || '未提交';
+      html += `<tr>
+        <td>${esc(req)}</td>
+        <td><span class="badge badge-${status === '已通过' ? 'success' : status === '需补充' ? 'warning' : status === '未提交' ? 'default' : 'info'}">${esc(status)}</span></td>
+        <td>${esc(item.notes || '')}</td>
+      </tr>`;
+    });
+  }
+  
+  html += '</tbody></table></div>';
+  html += `<button class="btn btn-sm mt-2" onclick="editSubsidy('${member.id}')">更新补贴资料</button>`;
+  html += '</div>';
+  return html;
+}
+
+function switchMemberTab(event, tabName) {
+  // Update tab buttons
+  event.currentTarget.parentElement.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  event.currentTarget.classList.add('active');
+  // Show content
+  const content = document.getElementById('member-tab-content');
+  if (content) {
+    content.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+    const pane = content.querySelector(`[data-tab="${tabName}"]`);
+    if (pane) pane.classList.add('active');
+  }
+}
+
+// Edit member intention details
+async function editMember(memberId) {
+  const member = await getById('projectMembers', memberId);
+  if (!member) { showToast('档案不存在', 'error'); return; }
+  
+  const intentionData = member.intentionData || {};
+  
+  showModal('编辑企业档案', `
+    <div class="form-grid">
+      <div class="form-group"><label>意向类型</label>
+        <select id="f-intentionType" class="form-input">
+          <option value="">未设置</option>
+          ${['光地展位','独立标准展位','中国区标准展位','联合参展','其他'].map(t => `<option value="${t}" ${member.intentionType===t?'selected':''}>${t}</option>`).join('')}
+        </select></div>
+      <div class="form-group"><label>意向面积(㎡)</label><input id="f-intendedArea" class="form-input" type="number" step="0.01" value="${member.intendedArea||''}" /></div>
+      <div class="form-group"><label>意向展位数量</label><input id="f-intendedBoothCount" class="form-input" type="number" value="${member.intendedBoothCount||''}" /></div>
+      <div class="form-group"><label>展位类型</label>
+        <select id="f-boothType" class="form-input">
+          <option value="">待确认</option>
+          ${['光地展位','独立标准展位','中国区标准展位','联合参展','其他'].map(t => `<option value="${t}" ${member.boothType===t?'selected':''}>${t}</option>`).join('')}
+        </select></div>
+      <div class="form-group"><label>意向馆号</label><input id="f-hall" class="form-input" value="${esc(intentionData.hall||'')}" /></div>
+      <div class="form-group"><label>意向位置</label><input id="f-location" class="form-input" value="${esc(intentionData.location||'')}" /></div>
+      <div class="form-group"><label>意向开口</label><input id="f-openings" class="form-input" value="${esc(intentionData.openings||'')}" /></div>
+      <div class="form-group"><label>意向价格</label><input id="f-price" class="form-input" type="number" step="0.01" value="${intentionData.price||''}" /></div>
+      <div class="form-group"><label>预计参展人数</label><input id="f-attendees" class="form-input" type="number" value="${intentionData.attendees||''}" /></div>
+      <div class="form-group"><label>下次跟进日期</label><input id="f-nextFollowUp" class="form-input" type="date" value="${fmtDate(member.nextFollowUp)}" /></div>
+      <div class="form-group"><label>合同状态</label>
+        <select id="f-contractStatus" class="form-input">
+          ${['未签订','草稿','待确认','已生成','已发送','待回签','已签订','履行中','已完成','已取消','已作废'].map(s => `<option value="${s}" ${member.contractStatus===s?'selected':''}>${s}</option>`).join('')}
+        </select></div>
+      <div class="form-group"><label>合同金额</label><input id="f-contractAmount" class="form-input" type="number" step="0.01" value="${member.contractAmount||''}" /></div>
+      <div class="form-group"><label>定金</label><input id="f-depositAmount" class="form-input" type="number" step="0.01" value="${member.depositAmount||''}" /></div>
+      <div class="form-group"><label>付款状态</label>
+        <select id="f-paymentStatus" class="form-input">
+          ${['未收款','部分收款','已收全款','多收款','待核对','已退款'].map(s => `<option value="${s}" ${member.paymentStatus===s?'selected':''}>${s}</option>`).join('')}
+        </select></div>
+      <div class="form-group"><label>业务归属</label><input id="f-businessOwner" class="form-input" value="${esc(member.businessOwner||member.owner||'')}" /></div>
+      <div class="form-group"><label>是否跟团</label>
+        <select id="f-isGroupTour" class="form-input">
+          <option value="false" ${!member.isGroupTour?'selected':''}>否</option>
+          <option value="true" ${member.isGroupTour?'selected':''}>是</option>
+        </select></div>
+      <div class="form-group"><label>是否申请补贴</label>
+        <select id="f-subsidyEnabled" class="form-input">
+          <option value="false" ${!member.subsidyEnabled?'selected':''}>否</option>
+          <option value="true" ${member.subsidyEnabled?'selected':''}>是</option>
+        </select></div>
+      <div class="form-group full-width"><label>备注</label><textarea id="f-notes" class="form-input" rows="3">${esc(member.notes)}</textarea></div>
+    </div>
+  `, async (overlay) => {
+    member.intentionType = overlay.querySelector('#f-intentionType').value;
+    member.intendedArea = overlay.querySelector('#f-intendedArea').value || '';
+    member.intendedBoothCount = parseInt(overlay.querySelector('#f-intendedBoothCount').value) || 0;
+    member.boothType = overlay.querySelector('#f-boothType').value;
+    member.nextFollowUp = overlay.querySelector('#f-nextFollowUp').value;
+    member.contractStatus = overlay.querySelector('#f-contractStatus').value;
+    member.contractAmount = parseFloat(overlay.querySelector('#f-contractAmount').value) || 0;
+    member.depositAmount = parseFloat(overlay.querySelector('#f-depositAmount').value) || 0;
+    member.paymentStatus = overlay.querySelector('#f-paymentStatus').value;
+    member.businessOwner = overlay.querySelector('#f-businessOwner').value.trim();
+    member.owner = member.businessOwner;
+    member.isGroupTour = overlay.querySelector('#f-isGroupTour').value === 'true';
+    member.subsidyEnabled = overlay.querySelector('#f-subsidyEnabled').value === 'true';
+    member.notes = overlay.querySelector('#f-notes').value.trim();
+    member.intentionData = {
+      ...intentionData,
+      hall: overlay.querySelector('#f-hall').value.trim(),
+      location: overlay.querySelector('#f-location').value.trim(),
+      openings: overlay.querySelector('#f-openings').value.trim(),
+      price: parseFloat(overlay.querySelector('#f-price').value) || 0,
+      attendees: parseInt(overlay.querySelector('#f-attendees').value) || 0
+    };
+    member.updatedAt = now();
+    await put('projectMembers', member);
+    await openMemberDetail(memberId);
+  });
+}
+
+// Add follow-up
+async function addFollowUp(memberId) {
+  showModal('添加跟进记录', `
+    <div class="form-grid">
+      <div class="form-group"><label>跟进日期 *</label><input id="f-date" class="form-input" type="datetime-local" value="${new Date().toISOString().slice(0,16)}" /></div>
+      <div class="form-group"><label>跟进方式</label>
+        <select id="f-method" class="form-input"><option>电话</option><option>微信</option><option>邮件</option><option>面谈</option><option>展会现场</option><option>其他</option></select></div>
+      <div class="form-group"><label>跟进人员</label><input id="f-person" class="form-input" value="新丝路" /></div>
+      <div class="form-group full-width"><label>跟进内容 *</label><textarea id="f-content" class="form-input" rows="4" required></textarea></div>
+      <div class="form-group full-width"><label>反馈</label><textarea id="f-feedback" class="form-input" rows="2"></textarea></div>
+      <div class="form-group"><label>下次跟进日期</label><input id="f-nextDate" class="form-input" type="date" /></div>
+    </div>
+  `, async (overlay) => {
+    const content = overlay.querySelector('#f-content').value.trim();
+    if (!content) throw new Error('跟进内容必填');
+    
+    const member = await getById('projectMembers', memberId);
+    if (!member) throw new Error('档案不存在');
+    
+    const followUp = {
+      id: generateId(),
+      date: overlay.querySelector('#f-date').value,
+      method: overlay.querySelector('#f-method').value,
+      person: overlay.querySelector('#f-person').value.trim(),
+      content: content,
+      feedback: overlay.querySelector('#f-feedback').value.trim(),
+      nextDate: overlay.querySelector('#f-nextDate').value,
+      createdAt: now()
+    };
+    
+    member.followUps = [...(member.followUps || []), followUp];
+    member.nextFollowUp = followUp.nextDate || member.nextFollowUp;
+    member.updatedAt = now();
+    await put('projectMembers', member);
+    await openMemberDetail(memberId);
+  });
+}
+
+// Add payment
+async function addPayment(memberId) {
+  const member = await getById('projectMembers', memberId);
+  if (!member) { showToast('档案不存在', 'error'); return; }
+  
+  showModal('添加付款记录', `
+    <div class="form-grid">
+      <div class="form-group"><label>付款日期 *</label><input id="f-paidAt" class="form-input" type="date" value="${new Date().toISOString().split('T')[0]}" /></div>
+      <div class="form-group"><label>金额 *</label><input id="f-amount" class="form-input" type="number" step="0.01" /></div>
+      <div class="form-group"><label>类型</label>
+        <select id="f-category" class="form-input">
+          <option>意向定金</option><option>展位费</option><option>展位费首款</option><option>展位费中期款</option><option>展位费尾款</option>
+          <option>报名费</option><option>会刊费</option><option>增租费</option><option>随团费用</option><option>其他费用</option>
+        </select></div>
+      <div class="form-group"><label>用途</label><input id="f-purpose" class="form-input" /></div>
+      <div class="form-group"><label>付款方式</label><input id="f-source" class="form-input" placeholder="银行转账/现金/微信/支付宝" /></div>
+      <div class="form-group"><label>核对状态</label>
+        <select id="f-verificationStatus" class="form-input"><option>待核对</option><option>已核对</option></select></div>
+      <div class="form-group full-width"><label>备注</label><textarea id="f-notes" class="form-input" rows="2"></textarea></div>
+    </div>
+  `, async (overlay) => {
+    const amount = parseFloat(overlay.querySelector('#f-amount').value);
+    if (!amount || amount <= 0) throw new Error('金额必须大于0');
+    
+    const payment = {
+      id: generateId(),
+      projectId: member.projectId,
+      companyId: member.companyId,
+      contractId: '',
+      receivableId: '',
+      amount: amount,
+      paidAt: overlay.querySelector('#f-paidAt').value,
+      category: overlay.querySelector('#f-category').value,
+      purpose: overlay.querySelector('#f-purpose').value.trim() || overlay.querySelector('#f-category').value,
+      source: overlay.querySelector('#f-source').value.trim(),
+      verificationStatus: overlay.querySelector('#f-verificationStatus').value,
+      validityStatus: '有效',
+      notes: overlay.querySelector('#f-notes').value.trim(),
+      createdAt: now(),
+      updatedAt: now()
+    };
+    await put('paymentRecords', payment);
+    
+    // 更新 member 付款状态
+    const allPayments = await getByIndex('paymentRecords', 'companyId', String(member.companyId));
+    const memberPayments = allPayments.filter(p => String(p.projectId) === String(member.projectId) && p.validityStatus !== '已作废');
+    const totalPaid = memberPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+    const contractAmount = Number(member.contractAmount) || 0;
+    
+    if (totalPaid <= 0) {
+      member.paymentStatus = '未收款';
+    } else if (totalPaid < contractAmount) {
+      member.paymentStatus = '部分收款';
+    } else if (Math.abs(totalPaid - contractAmount) < 0.01) {
+      member.paymentStatus = '已收全款';
+    } else {
+      member.paymentStatus = '多收款';
+    }
+    member.updatedAt = now();
+    await put('projectMembers', member);
+    await openMemberDetail(memberId);
+  });
+}
+
+// Add booth
+async function addBooth(memberId) {
+  const member = await getById('projectMembers', memberId);
+  if (!member) { showToast('档案不存在', 'error'); return; }
+  
+  showModal('确认展位', `
+    <div class="form-grid">
+      <div class="form-group"><label>展位类型</label>
+        <select id="f-boothType" class="form-input">
+          <option>光地展位</option><option>独立标准展位</option><option>中国区标准展位</option><option>联合参展</option><option>其他</option>
+        </select></div>
+      <div class="form-group"><label>面积(㎡)</label><input id="f-area" class="form-input" type="number" step="0.01" /></div>
+      <div class="form-group"><label>展位数量</label><input id="f-boothCount" class="form-input" type="number" /></div>
+      <div class="form-group"><label>馆号</label><input id="f-hallNumber" class="form-input" /></div>
+      <div class="form-group"><label>展位号</label><input id="f-boothNumber" class="form-input" /></div>
+      <div class="form-group"><label>开口</label>
+        <select id="f-openingType" class="form-input">
+          <option>暂未确定</option><option>一面开</option><option>两面开</option><option>三面开</option><option>四面开</option>
+        </select></div>
+      <div class="form-group"><label>状态</label>
+        <select id="f-status" class="form-input"><option>待确认</option><option>已确认</option></select></div>
+      <div class="form-group"><label>确认日期</label><input id="f-confirmedAt" class="form-input" type="date" /></div>
+      <div class="form-group full-width"><label>位置备注</label><textarea id="f-locationNotes" class="form-input" rows="2"></textarea></div>
+    </div>
+  `, async (overlay) => {
+    const booth = {
+      id: generateId(),
+      projectId: member.projectId,
+      companyId: member.companyId,
+      boothType: overlay.querySelector('#f-boothType').value,
+      area: overlay.querySelector('#f-area').value || '',
+      boothCount: parseInt(overlay.querySelector('#f-boothCount').value) || 0,
+      hallNumber: overlay.querySelector('#f-hallNumber').value.trim(),
+      boothNumber: overlay.querySelector('#f-boothNumber').value.trim(),
+      openingType: overlay.querySelector('#f-openingType').value,
+      status: overlay.querySelector('#f-status').value,
+      confirmedAt: overlay.querySelector('#f-confirmedAt').value || now(),
+      confirmedBy: '',
+      locationNotes: overlay.querySelector('#f-locationNotes').value.trim(),
+      sourceSnapshot: '{}',
+      unitPrice: 0,
+      totalPrice: 0,
+      updatedAt: now()
+    };
+    await put('boothConfirmations', booth);
+    await openMemberDetail(memberId);
+  });
+}
+
+// Add rental
+async function addRental(memberId) {
+  const member = await getById('projectMembers', memberId);
+  if (!member) { showToast('档案不存在', 'error'); return; }
+  
+  showModal('添加增租', `
+    <div class="form-grid">
+      <div class="form-group"><label>类别</label><input id="f-category" class="form-input" /></div>
+      <div class="form-group"><label>规格</label><input id="f-spec" class="form-input" /></div>
+      <div class="form-group"><label>数量</label><input id="f-quantity" class="form-input" type="number" /></div>
+      <div class="form-group"><label>单价</label><input id="f-unitPrice" class="form-input" type="number" step="0.01" /></div>
+      <div class="form-group"><label>总金额</label><input id="f-totalPrice" class="form-input" type="number" step="0.01" /></div>
+      <div class="form-group"><label>已收金额</label><input id="f-paidAmount" class="form-input" type="number" step="0.01" value="0" /></div>
+      <div class="form-group"><label>付款状态</label>
+        <select id="f-paymentStatus" class="form-input"><option>未收款</option><option>部分收款</option><option>已收全款</option></select></div>
+      <div class="form-group full-width"><label>备注</label><textarea id="f-notes" class="form-input" rows="2"></textarea></div>
+    </div>
+  `, async (overlay) => {
+    const rental = {
+      id: generateId(),
+      category: overlay.querySelector('#f-category').value.trim(),
+      spec: overlay.querySelector('#f-spec').value.trim(),
+      quantity: parseInt(overlay.querySelector('#f-quantity').value) || 0,
+      unitPrice: parseFloat(overlay.querySelector('#f-unitPrice').value) || 0,
+      totalPrice: parseFloat(overlay.querySelector('#f-totalPrice').value) || 0,
+      paidAmount: parseFloat(overlay.querySelector('#f-paidAmount').value) || 0,
+      paymentStatus: overlay.querySelector('#f-paymentStatus').value,
+      notes: overlay.querySelector('#f-notes').value.trim()
+    };
+    member.rentals = [...(member.rentals || []), rental];
+    member.updatedAt = now();
+    await put('projectMembers', member);
+    await openMemberDetail(memberId);
+  });
+}
+
+// Edit group travel
+async function editGroupTravel(memberId) {
+  const member = await getById('projectMembers', memberId);
+  if (!member) { showToast('档案不存在', 'error'); return; }
+  const gt = member.groupTravel || {};
+  
+  showModal('编辑随团信息', `
+    <div class="form-grid">
+      <div class="form-group"><label>是否跟团</label>
+        <select id="f-isGroupTour" class="form-input"><option value="false">否</option><option value="true" ${member.isGroupTour?'selected':''}>是</option></select></div>
+      <div class="form-group"><label>跟团人数</label><input id="f-count" class="form-input" type="number" value="${gt.count||''}" /></div>
+      <div class="form-group"><label>参展人员</label><input id="f-participants" class="form-input" value="${esc(gt.participants||'')}" /></div>
+      <div class="form-group"><label>护照</label><input id="f-passport" class="form-input" value="${esc(gt.passport||'')}" /></div>
+      <div class="form-group"><label>签证</label><input id="f-visa" class="form-input" value="${esc(gt.visa||'')}" /></div>
+      <div class="form-group"><label>机票</label><input id="f-flight" class="form-input" value="${esc(gt.flight||'')}" /></div>
+      <div class="form-group"><label>酒店</label><input id="f-hotel" class="form-input" value="${esc(gt.hotel||'')}" /></div>
+      <div class="form-group"><label>保险</label><input id="f-insurance" class="form-input" value="${esc(gt.insurance||'')}" /></div>
+      <div class="form-group"><label>接送机</label><input id="f-transfer" class="form-input" value="${esc(gt.transfer||'')}" /></div>
+      <div class="form-group"><label>总费用</label><input id="f-totalCost" class="form-input" type="number" step="0.01" value="${gt.totalCost||''}" /></div>
+      <div class="form-group"><label>已收</label><input id="f-paidAmount" class="form-input" type="number" step="0.01" value="${gt.paidAmount||''}" /></div>
+      <div class="form-group full-width"><label>备注</label><textarea id="f-notes" class="form-input" rows="2">${esc(gt.notes||'')}</textarea></div>
+    </div>
+  `, async (overlay) => {
+    member.isGroupTour = overlay.querySelector('#f-isGroupTour').value === 'true';
+    member.groupTravel = {
+      count: parseInt(overlay.querySelector('#f-count').value) || 0,
+      participants: overlay.querySelector('#f-participants').value.trim(),
+      passport: overlay.querySelector('#f-passport').value.trim(),
+      visa: overlay.querySelector('#f-visa').value.trim(),
+      flight: overlay.querySelector('#f-flight').value.trim(),
+      hotel: overlay.querySelector('#f-hotel').value.trim(),
+      insurance: overlay.querySelector('#f-insurance').value.trim(),
+      transfer: overlay.querySelector('#f-transfer').value.trim(),
+      totalCost: parseFloat(overlay.querySelector('#f-totalCost').value) || 0,
+      paidAmount: parseFloat(overlay.querySelector('#f-paidAmount').value) || 0,
+      notes: overlay.querySelector('#f-notes').value.trim()
+    };
+    member.updatedAt = now();
+    await put('projectMembers', member);
+    await openMemberDetail(memberId);
+  });
+}
+
+// Edit subsidy
+async function editSubsidy(memberId) {
+  const member = await getById('projectMembers', memberId);
+  if (!member) { showToast('档案不存在', 'error'); return; }
+  const project = await getById('projects', String(member.projectId));
+  const requirements = project ? (project.subsidyRequirements || []) : [];
+  const currentMaterials = member.subsidyMaterials || {};
+  
+  let formHtml = `
+    <div class="form-group"><label>是否申请补贴</label>
+      <select id="f-subsidyEnabled" class="form-input">
+        <option value="true" ${member.subsidyEnabled?'selected':''}>是</option>
+        <option value="false" ${!member.subsidyEnabled?'selected':''}>否</option>
+      </select></div>
+    <h4 class="mt-2">资料状态</h4>`;
+  
+  requirements.forEach(req => {
+    const item = currentMaterials[req] || {};
+    formHtml += `
+      <div class="form-row">
+        <span class="form-label">${esc(req)}</span>
+        <select name="subsidy-status" data-key="${esc(req)}" class="form-input sm">
+          <option value="未提交" ${(item.status||'未提交')==='未提交'?'selected':''}>未提交</option>
+          <option value="已提交" ${item.status==='已提交'?'selected':''}>已提交</option>
+          <option value="待审核" ${item.status==='待审核'?'selected':''}>待审核</option>
+          <option value="需补充" ${item.status==='需补充'?'selected':''}>需补充</option>
+          <option value="已通过" ${item.status==='已通过'?'selected':''}>已通过</option>
+          <option value="不适用" ${item.status==='不适用'?'selected':''}>不适用</option>
+        </select>
+        <input name="subsidy-notes" data-key="${esc(req)}" class="form-input sm" placeholder="备注" value="${esc(item.notes||'')}" />
+      </div>`;
+  });
+  
+  showModal('补贴资料管理', formHtml, async (overlay) => {
+    member.subsidyEnabled = overlay.querySelector('#f-subsidyEnabled').value === 'true';
+    
+    const newMaterials = {};
+    const statusSelects = overlay.querySelectorAll('select[name="subsidy-status"]');
+    const notesInputs = overlay.querySelectorAll('input[name="subsidy-notes"]');
+    
+    statusSelects.forEach(s => {
+      const key = s.dataset.key;
+      newMaterials[key] = { status: s.value, notes: '' };
+    });
+    notesInputs.forEach(n => {
+      const key = n.dataset.key;
+      if (newMaterials[key]) newMaterials[key].notes = n.value.trim();
+    });
+    
+    member.subsidyMaterials = newMaterials;
+    member.updatedAt = now();
+    await put('projectMembers', member);
+    await openMemberDetail(memberId);
+  });
+}
+
+</script>
+
+<!-- src/js/modules/contracts.js -->
+<script>
+/**
+ * 合同中心模块 - 全局合同管理
+ */
+async function renderContracts() {
+  const contracts = await getAll('contracts');
+  const companies = await getAll('companies');
+  const projects = await getAll('projects');
+  
+  let html = `<div class="panel">
+    <div class="panel-header">
+      <h2>📝 合同中心 (${contracts.length} 份)</h2>
+    </div>
+    <div class="filter-bar">
+      <input type="text" id="contract-search" class="search-input" placeholder="搜索合同编号..." oninput="filterContracts()" />
+      <select id="filter-contract-status" class="filter-select" onchange="filterContracts()">
+        <option value="">全部状态</option>
+        <option>未签订</option><option>草稿</option><option>待确认</option><option>已生成</option><option>已发送</option><option>待回签</option><option>已签订</option><option>履行中</option><option>已完成</option><option>已取消</option><option>已作废</option>
+      </select>
+      <select id="filter-contract-project" class="filter-select" onchange="filterContracts()">
+        <option value="">全部项目</option>
+        ${projects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}
+      </select>
+    </div>
+    <div class="table-container" id="contracts-table">
+      ${renderContractTable(contracts, companies, projects)}
+    </div>
+  </div>`;
+  return html;
+}
+
+function renderContractTable(contracts, companies, projects) {
+  if (contracts.length === 0) {
+    return '<p class="text-muted text-center p-4">暂无合同</p>';
+  }
+  
+  return `<table class="data-table">
+    <thead><tr>
+      <th>合同编号</th><th>企业</th><th>项目</th><th>模板</th><th>状态</th>
+      <th>展位费</th><th>其他费</th><th>总金额</th><th>签署日期</th><th>操作</th>
+    </tr></thead>
+    <tbody>
+      ${contracts.map(c => {
+        const company = companies.find(co => String(co.id) === String(c.companyId));
+        const project = projects.find(p => String(p.id) === String(c.projectId));
+        return `<tr>
+          <td><strong>${esc(c.contractNumber || '未编号')}</strong></td>
+          <td>${esc(company ? company.companyCn : c.companyId)}</td>
+          <td>${esc(project ? project.name : '')}</td>
+          <td>${esc(c.templateKey || '-')}</td>
+          <td><span class="badge badge-${getContractStatusClass(c.status)}">${esc(c.status)}</span></td>
+          <td>¥${fmt(c.boothSubtotal)}</td>
+          <td>¥${fmt(c.otherFeeSubtotal)}</td>
+          <td>¥${fmt(c.totalAmount)}</td>
+          <td>${fmtDate(c.signedAt)}</td>
+          <td class="actions">
+            <button class="btn btn-xs" onclick="viewContract('${c.id}')">查看</button>
+            <button class="btn btn-xs" onclick="editContract('${c.id}')">编辑</button>
+          </td>
+        </tr>`;
+      }).join('')}
+    </tbody>
+  </table>`;
+}
+
+async function filterContracts() {
+  const query = (document.getElementById('contract-search')?.value || '').toLowerCase();
+  const status = document.getElementById('filter-contract-status')?.value || '';
+  const projectId = document.getElementById('filter-contract-project')?.value || '';
+  
+  let contracts = await getAll('contracts');
+  const companies = await getAll('companies');
+  const projects = await getAll('projects');
+  
+  if (query) {
+    contracts = contracts.filter(c => 
+      (c.contractNumber && c.contractNumber.toLowerCase().includes(query)) ||
+      companies.some(co => String(co.id) === String(c.companyId) && co.companyCn && co.companyCn.toLowerCase().includes(query))
+    );
+  }
+  if (status) contracts = contracts.filter(c => c.status === status);
+  if (projectId) contracts = contracts.filter(c => String(c.projectId) === projectId);
+  
+  const container = document.getElementById('contracts-table');
+  if (container) container.innerHTML = renderContractTable(contracts, companies, projects);
+}
+
+async function createContract(memberId) {
+  const member = await getById('projectMembers', memberId);
+  if (!member) { showToast('档案不存在', 'error'); return; }
+  const project = await getById('projects', String(member.projectId));
+  const company = await getById('companies', String(member.companyId));
+  
+  if (!project) { showToast('项目不存在', 'error'); return; }
+  
+  // Try to generate contract number
+  let contractNumber = '';
+  try {
+    contractNumber = await generateContractNumber(member.projectId);
+  } catch(e) {
+    showToast(e.message, 'warning');
+  }
+  
+  const config = project.profitConfig || {};
+  
+  showModal('创建合同', `
+    <div class="form-grid">
+      <div class="form-group"><label>合同编号</label><input id="f-contractNumber" class="form-input" value="${contractNumber}" readonly /></div>
+      <div class="form-group"><label>模板</label>
+        <select id="f-templateKey" class="form-input">
+          <option value="">通用合同</option>
+          <option value="欧洲智慧能源展专用合同" ${project.englishName === 'The SMARTER E Europe' ? 'selected' : ''}>欧洲智慧能源展专用合同</option>
+          <option value="标准展位合同">标准展位合同</option>
+          <option value="空地合同">空地合同</option>
+          <option value="联合参展合同">联合参展合同</option>
+        </select></div>
+      <div class="form-group"><label>状态</label>
+        <select id="f-status" class="form-input"><option>草稿</option><option>待确认</option></select></div>
+      <div class="form-group"><label>币种</label><input id="f-currency" class="form-input" value="CNY" /></div>
+      <div class="form-group"><label>展位费小计</label><input id="f-boothSubtotal" class="form-input" type="number" step="0.01" /></div>
+      <div class="form-group"><label>其他费用小计</label><input id="f-otherFeeSubtotal" class="form-input" type="number" step="0.01" /></div>
+      <div class="form-group"><label>合同总金额</label><input id="f-totalAmount" class="form-input" type="number" step="0.01" /></div>
+      <div class="form-group full-width"><label>费用明细(JSON)</label><textarea id="f-feeLines" class="form-input" rows="4">[]</textarea></div>
+      <div class="form-group full-width"><label>付款计划(JSON)</label><textarea id="f-paymentTerms" class="form-input" rows="3">{}</textarea></div>
+    </div>
+  `, async (overlay) => {
+    const totalAmountInput = overlay.querySelector('#f-totalAmount').value.trim();
+    const totalAmount = totalAmountInput !== '' ? parseFloat(totalAmountInput) : (boothSubtotal + otherFeeSubtotal);
+    const boothSubtotal = parseFloat(overlay.querySelector('#f-boothSubtotal').value) || 0;
+    const otherFeeSubtotal = parseFloat(overlay.querySelector('#f-otherFeeSubtotal').value) || 0;
+    
+    let feeLines = [];
+    try { feeLines = JSON.parse(overlay.querySelector('#f-feeLines').value); } catch(e) {}
+    let paymentTerms = {};
+    try { paymentTerms = JSON.parse(overlay.querySelector('#f-paymentTerms').value); } catch(e) {}
+    
+    const contract = {
+      id: generateId(),
+      projectId: member.projectId,
+      companyId: member.companyId,
+      contractNumber: overlay.querySelector('#f-contractNumber').value.trim() || contractNumber,
+      templateKey: overlay.querySelector('#f-templateKey').value,
+      version: 1,
+      status: overlay.querySelector('#f-status').value,
+      currency: overlay.querySelector('#f-currency').value,
+      boothSubtotal: boothSubtotal,
+      otherFeeSubtotal: otherFeeSubtotal,
+      totalAmount: totalAmount,
+      totalAmountUppercase: amountToChinese(totalAmount),
+      boothSnapshot: '{}',
+      partySnapshot: '{}',
+      feeLines: JSON.stringify(feeLines),
+      paymentTerms: JSON.stringify(paymentTerms),
+      templateSnapshot: '{}',
+      signedAt: '',
+      createdAt: now(),
+      updatedAt: now()
+    };
+    await put('contracts', contract);
+    
+    // Update member contract info
+    member.contractStatus = contract.status === '草稿' ? '草稿' : contract.status;
+    member.contractNumber = contract.contractNumber;
+    member.contractAmount = contract.totalAmount;
+    member.updatedAt = now();
+    await put('projectMembers', member);
+    await openMemberDetail(memberId);
+  });
+
+async function viewContract(contractId) {
+  const contract = await getById('contracts', contractId);
+  if (!contract) { showToast('合同不存在', 'error'); return; }
+  
+  const company = await getById('companies', String(contract.companyId));
+  const project = await getById('projects', String(contract.projectId));
+  
+  let feeLines = [];
+  try { feeLines = JSON.parse(contract.feeLines || '[]'); } catch(e) {}
+  let paymentTerms = {};
+  try { paymentTerms = JSON.parse(contract.paymentTerms || '{}'); } catch(e) {}
+  let boothSnapshot = {};
+  try { boothSnapshot = JSON.parse(contract.boothSnapshot || '{}'); } catch(e) {}
+  let partySnapshot = {};
+  try { partySnapshot = JSON.parse(contract.partySnapshot || '{}'); } catch(e) {}
+  
+  let html = `<div class="panel">
+    <div class="panel-header">
+      <h2>📝 合同详情</h2>
+      <button class="btn btn-sm" onclick="navigateTo('contracts')">返回合同中心</button>
+    </div>
+    <div class="panel-body">
+      <div class="detail-grid">
+        <div class="detail-item"><label>合同编号</label><span><strong>${esc(contract.contractNumber)}</strong></span></div>
+        <div class="detail-item"><label>企业</label><span>${esc(company ? company.companyCn : '')}</span></div>
+        <div class="detail-item"><label>项目</label><span>${esc(project ? project.name : '')}</span></div>
+        <div class="detail-item"><label>展会名称</label><span>${esc(project ? project.name : '')}</span></div>
+        <div class="detail-item"><label>展会时间</label><span>${fmtDate(project ? project.startDate : '')} - ${fmtDate(project ? project.endDate : '')}</span></div>
+        <div class="detail-item"><label>展会地点</label><span>${esc(project ? project.location : '')}</span></div>
+        <div class="detail-item"><label>模板</label><span>${esc(contract.templateKey)}</span></div>
+        <div class="detail-item"><label>状态</label><span class="badge badge-${getContractStatusClass(contract.status)}">${esc(contract.status)}</span></div>
+        <div class="detail-item"><label>版本</label><span>${contract.version}</span></div>
+        <div class="detail-item"><label>币种</label><span>${esc(contract.currency)}</span></div>
+        <div class="detail-item"><label>展位费小计</label><span>¥${fmt(contract.boothSubtotal)}</span></div>
+        <div class="detail-item"><label>其他费用</label><span>¥${fmt(contract.otherFeeSubtotal)}</span></div>
+        <div class="detail-item"><label>合同总金额</label><span style="font-size:1.2em;color:var(--accent);font-weight:bold">¥${fmt(contract.totalAmount)}</span></div>
+        <div class="detail-item"><label>大写</label><span>${esc(contract.totalAmountUppercase)}</span></div>
+        <div class="detail-item"><label>签署日期</label><span>${fmtDate(contract.signedAt)}</span></div>
+        <div class="detail-item"><label>创建时间</label><span>${fmtDate(contract.createdAt)}</span></div>
+      </div>
+      
+      <h4 class="mt-2">费用明细</h4>
+      <div class="table-container">
+        ${feeLines.length > 0 ? `
+          <table class="data-table">
+            <thead><tr><th>类型</th><th>项目</th><th>数量</th><th>单位</th><th>单价</th><th>金额</th></tr></thead>
+            <tbody>
+              ${feeLines.map(f => `<tr><td>${esc(f.kind||'')}</td><td>${esc(f.label||'')}</td><td>${f.quantity||0}</td><td>${esc(f.unit||'')}</td><td>¥${fmt(f.unitPrice)}</td><td>¥${fmt((f.quantity||0)*(f.unitPrice||0))}</td></tr>`).join('')}
+            </tbody>
+          </table>
+        ` : '<p class="text-muted">暂无费用明细</p>'}
+      </div>
+      
+      <div style="margin-top:16px">
+        <button class="btn btn-primary" onclick="exportContractPDF('${contractId}')">📄 导出合同PDF</button>
+        <button class="btn" onclick="editContract('${contractId}')">编辑合同</button>
+      </div>
+    </div>
+  </div>`;
+  
+  document.getElementById('content-area').innerHTML = html;
+}
+
+async function editContract(contractId) {
+  const contract = await getById('contracts', contractId);
+  if (!contract) { showToast('合同不存在', 'error'); return; }
+  
+  showModal('编辑合同', `
+    <div class="form-grid">
+      <div class="form-group"><label>合同编号</label><input id="f-contractNumber" class="form-input" value="${esc(contract.contractNumber)}" /></div>
+      <div class="form-group"><label>状态</label>
+        <select id="f-status" class="form-input">
+          ${['草稿','待确认','已生成','已发送','待回签','已签订','履行中','已完成','已取消','已作废'].map(s => `<option value="${s}" ${contract.status===s?'selected':''}>${s}</option>`).join('')}
+        </select></div>
+      <div class="form-group"><label>展位费</label><input id="f-boothSubtotal" class="form-input" type="number" step="0.01" value="${contract.boothSubtotal||0}" /></div>
+      <div class="form-group"><label>其他费用</label><input id="f-otherFeeSubtotal" class="form-input" type="number" step="0.01" value="${contract.otherFeeSubtotal||0}" /></div>
+      <div class="form-group"><label>总金额</label><input id="f-totalAmount" class="form-input" type="number" step="0.01" value="${contract.totalAmount||0}" /></div>
+      <div class="form-group"><label>签署日期</label><input id="f-signedAt" class="form-input" type="date" value="${fmtDate(contract.signedAt)}" /></div>
+      <div class="form-group full-width"><label>费用明细</label><textarea id="f-feeLines" class="form-input" rows="4">${contract.feeLines||'[]'}</textarea></div>
+      <div class="form-group full-width"><label>付款计划</label><textarea id="f-paymentTerms" class="form-input" rows="3">${contract.paymentTerms||'{}'}</textarea></div>
+    </div>
+  `, async (overlay) => {
+    const totalAmountInput = overlay.querySelector('#f-totalAmount').value.trim();
+    const totalAmount = totalAmountInput !== '' ? parseFloat(totalAmountInput) : 0;
+    contract.contractNumber = overlay.querySelector('#f-contractNumber').value.trim();
+    contract.status = overlay.querySelector('#f-status').value;
+    contract.boothSubtotal = parseFloat(overlay.querySelector('#f-boothSubtotal').value) || 0;
+    contract.otherFeeSubtotal = parseFloat(overlay.querySelector('#f-otherFeeSubtotal').value) || 0;
+    contract.totalAmount = totalAmount;
+    contract.totalAmountUppercase = amountToChinese(totalAmount);
+    contract.signedAt = overlay.querySelector('#f-signedAt').value;
+    contract.feeLines = overlay.querySelector('#f-feeLines').value.trim();
+    contract.paymentTerms = overlay.querySelector('#f-paymentTerms').value.trim();
+    contract.updatedAt = now();
+    
+    await put('contracts', contract);
+    
+    // Sync with member
+    const members = await getByIndex('projectMembers', 'companyId', String(contract.companyId));
+    const member = members.find(m => String(m.projectId) === String(contract.projectId));
+    if (member) {
+      member.contractStatus = contract.status;
+      member.contractNumber = contract.contractNumber;
+      member.contractAmount = contract.totalAmount;
+      member.updatedAt = now();
+      await put('projectMembers', member);
+    }
+  });
+}
+
+async function exportContractPDF(contractId) {
+  showToast('合同导出功能已就绪。请使用浏览器的"打印"功能(Ctrl+P 或 Cmd+P)导出为PDF。', 'info');
+}
+
+</script>
+
+<!-- src/js/modules/payments.js -->
+<script>
+/**
+ * 付款中心模块
+ */
+async function renderPayments() {
+  const payments = await getAll('paymentRecords');
+  const companies = await getAll('companies');
+  const projects = await getAll('projects');
+  
+  const totalAmount = payments.filter(p => p.validityStatus !== '已作废').reduce((s, p) => s + (Number(p.amount) || 0), 0);
+  
+  let html = `<div class="panel">
+    <div class="panel-header">
+      <h2>💰 付款中心</h2>
+      <div class="panel-actions">
+        <span class="text-muted">总收款: <strong>¥${fmt(totalAmount)}</strong> (${payments.length} 笔)</span>
+      </div>
+    </div>
+    <div class="filter-bar">
+      <select id="filter-payment-project" class="filter-select" onchange="filterPayments()">
+        <option value="">全部项目</option>
+        ${projects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}
+      </select>
+      <select id="filter-payment-status" class="filter-select" onchange="filterPayments()">
+        <option value="">全部核对状态</option>
+        <option>待核对</option><option>已核对</option>
+      </select>
+      <select id="filter-payment-category" class="filter-select" onchange="filterPayments()">
+        <option value="">全部类型</option>
+        <option>意向定金</option><option>展位费</option><option>展位费首款</option><option>展位费中期款</option><option>展位费尾款</option>
+        <option>报名费</option><option>会刊费</option><option>增租费</option><option>随团费用</option><option>其他费用</option>
+      </select>
+    </div>
+    <div class="table-container" id="payments-table">
+      ${renderPaymentTable(payments, companies, projects)}
+    </div>
+  </div>`;
+  return html;
+}
+
+function renderPaymentTable(payments, companies, projects) {
+  const validPayments = payments.filter(p => p.validityStatus !== '已作废');
+  const total = validPayments.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+  
+  let html = '';
+  if (validPayments.length === 0) {
+    html += '<p class="text-muted text-center p-4">暂无付款记录</p>';
+  } else {
+    html += `<table class="data-table">
+      <thead><tr>
+        <th>日期</th><th>企业</th><th>项目</th><th>类型</th><th>用途</th>
+        <th>金额</th><th>核对</th><th>备注</th><th>操作</th>
+      </tr></thead>
+      <tbody>`;
+    validPayments.forEach(p => {
+      const company = companies.find(c => String(c.id) === String(p.companyId));
+      const project = projects.find(pr => String(pr.id) === String(p.projectId));
+      html += `<tr>
+        <td>${fmtDate(p.paidAt)}</td>
+        <td>${esc(company ? company.companyCn : '')}</td>
+        <td>${esc(project ? project.name : '')}</td>
+        <td>${esc(p.category)}</td>
+        <td>${esc(p.purpose || '')}</td>
+        <td class="amount">¥${fmt(p.amount)}</td>
+        <td><span class="badge badge-${p.verificationStatus === '已核对' ? 'success' : 'warning'}">${esc(p.verificationStatus)}</span></td>
+        <td>${esc(p.notes || '')}</td>
+        <td class="actions">
+          <button class="btn btn-xs" onclick="editPayment('${p.id}')">编辑</button>
+          <button class="btn btn-xs btn-danger" onclick="voidPayment('${p.id}')">作废</button>
+        </td>
+      </tr>`;
+    });
+    html += `</tbody><tfoot><tr><td colspan="5" class="text-right"><strong>合计</strong></td><td class="amount"><strong>¥${fmt(total)}</strong></td><td colspan="3"></td></tr></tfoot></table>`;
+  }
+  return html;
+}
+
+async function filterPayments() {
+  const projectId = document.getElementById('filter-payment-project')?.value || '';
+  const status = document.getElementById('filter-payment-status')?.value || '';
+  const category = document.getElementById('filter-payment-category')?.value || '';
+  
+  let payments = await getAll('paymentRecords');
+  if (projectId) payments = payments.filter(p => String(p.projectId) === projectId);
+  if (status) payments = payments.filter(p => p.verificationStatus === status);
+  if (category) payments = payments.filter(p => p.category === category);
+  
+  const companies = await getAll('companies');
+  const projects = await getAll('projects');
+  
+  const container = document.getElementById('payments-table');
+  if (container) container.innerHTML = renderPaymentTable(payments, companies, projects);
+}
+
+async function editPayment(paymentId) {
+  const payment = await getById('paymentRecords', paymentId);
+  if (!payment) { showToast('付款记录不存在', 'error'); return; }
+  
+  showModal('编辑付款记录', `
+    <div class="form-grid">
+      <div class="form-group"><label>付款日期</label><input id="f-paidAt" class="form-input" type="date" value="${fmtDate(payment.paidAt)}" /></div>
+      <div class="form-group"><label>金额</label><input id="f-amount" class="form-input" type="number" step="0.01" value="${payment.amount}" /></div>
+      <div class="form-group"><label>类型</label>
+        <select id="f-category" class="form-input">
+          ${['意向定金','展位费','展位费首款','展位费中期款','展位费尾款','报名费','会刊费','增租费','随团费用','其他费用'].map(c => `<option value="${c}" ${payment.category===c?'selected':''}>${c}</option>`).join('')}
+        </select></div>
+      <div class="form-group"><label>用途</label><input id="f-purpose" class="form-input" value="${esc(payment.purpose)}" /></div>
+      <div class="form-group"><label>核对状态</label>
+        <select id="f-verificationStatus" class="form-input">
+          <option ${payment.verificationStatus==='待核对'?'selected':''}>待核对</option>
+          <option ${payment.verificationStatus==='已核对'?'selected':''}>已核对</option>
+        </select></div>
+      <div class="form-group full-width"><label>备注</label><textarea id="f-notes" class="form-input" rows="2">${esc(payment.notes)}</textarea></div>
+    </div>
+  `, async (overlay) => {
+    payment.paidAt = overlay.querySelector('#f-paidAt').value;
+    payment.amount = parseFloat(overlay.querySelector('#f-amount').value) || 0;
+    payment.category = overlay.querySelector('#f-category').value;
+    payment.purpose = overlay.querySelector('#f-purpose').value.trim();
+    payment.verificationStatus = overlay.querySelector('#f-verificationStatus').value;
+    payment.notes = overlay.querySelector('#f-notes').value.trim();
+    payment.updatedAt = now();
+    await put('paymentRecords', payment);
+    
+    // 同步更新 member 付款状态
+    const memberPayments = await getByIndex('paymentRecords', 'companyId', String(payment.companyId));
+    const projPayments = memberPayments.filter(p => String(p.projectId) === String(payment.projectId) && p.validityStatus !== '已作废');
+    const totalPaid = projPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+    const members = await getByIndex('projectMembers', 'companyId', String(payment.companyId));
+    const member = members.find(m => String(m.projectId) === String(payment.projectId));
+    if (member) {
+      const contractAmount = Number(member.contractAmount) || 0;
+      if (totalPaid <= 0) member.paymentStatus = '未收款';
+      else if (totalPaid < contractAmount) member.paymentStatus = '部分收款';
+      else if (Math.abs(totalPaid - contractAmount) < 0.01) member.paymentStatus = '已收全款';
+      else member.paymentStatus = '多收款';
+      member.updatedAt = now();
+      await put('projectMembers', member);
+    }
+    
+    showToast('付款记录已更新', 'success');
+  });
+}
+
+async function voidPayment(paymentId) {
+  const payment = await getById('paymentRecords', paymentId);
+  if (!payment) { showToast('付款记录不存在', 'error'); return; }
+  
+  if (!confirm(`确定要作废这笔付款吗？\n\n金额: ¥${fmt(payment.amount)}\n日期: ${fmtDate(payment.paidAt)}\n\n作废后该记录将保留但标记为无效。`)) return;
+  
+  payment.validityStatus = '已作废';
+  payment.updatedAt = now();
+  await put('paymentRecords', payment);
+  
+  // 同步更新 member 付款状态
+  const memberPayments = await getByIndex('paymentRecords', 'companyId', String(payment.companyId));
+  const projPayments = memberPayments.filter(p => String(p.projectId) === String(payment.projectId) && p.validityStatus !== '已作废');
+  const totalPaid = projPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+  const members = await getByIndex('projectMembers', 'companyId', String(payment.companyId));
+  const member = members.find(m => String(m.projectId) === String(payment.projectId));
+  if (member) {
+    const contractAmount = Number(member.contractAmount) || 0;
+    if (totalPaid <= 0) member.paymentStatus = '未收款';
+    else if (totalPaid < contractAmount) member.paymentStatus = '部分收款';
+    else if (Math.abs(totalPaid - contractAmount) < 0.01) member.paymentStatus = '已收全款';
+    else member.paymentStatus = '多收款';
+    member.updatedAt = now();
+    await put('projectMembers', member);
+  }
+  
+  showToast('付款记录已作废', 'warning');
+  navigateTo('payments');
+}
+
+</script>
+
+<!-- src/js/modules/extra.js -->
+<script>
+/**
+ * 展位管理 + 增租 + 随团 + 补贴 + 备份 + 设置模块
+ */
+async function renderBooths() {
+  const booths = await getAll('boothConfirmations');
+  const companies = await getAll('companies');
+  const projects = await getAll('projects');
+  
+  let html = `<div class="panel">
+    <div class="panel-header">
+      <h2>🏗 展位管理 (${booths.length} 个)</h2>
+    </div>
+    <div class="table-container">`;
+  
+  if (booths.length === 0) {
+    html += '<p class="text-muted text-center p-4">暂无展位确认记录</p>';
+  } else {
+    html += `<table class="data-table">
+      <thead><tr>
+        <th>企业</th><th>项目</th><th>展位号</th><th>类型</th><th>面积</th><th>数量</th>
+        <th>馆号</th><th>开口</th><th>状态</th><th>确认日期</th>
+      </tr></thead>
+      <tbody>`;
+    booths.forEach(b => {
+      const c = companies.find(co => String(co.id) === String(b.companyId));
+      const p = projects.find(pr => String(pr.id) === String(b.projectId));
+      html += `<tr>
+        <td>${esc(c ? c.companyCn : '')}</td>
+        <td>${esc(p ? p.name : '')}</td>
+        <td>${esc(b.boothNumber || '待分配')}</td>
+        <td>${esc(b.boothType)}</td>
+        <td>${esc(b.area)}</td>
+        <td>${b.boothCount}</td>
+        <td>${esc(b.hallNumber)}</td>
+        <td>${esc(b.openingType)}</td>
+        <td><span class="badge">${esc(b.status)}</span></td>
+        <td>${fmtDate(b.confirmedAt)}</td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+  }
+  
+  html += '</div></div>';
+  return html;
+}
+
+async function editBooth(boothId) {
+  const booth = await getById('boothConfirmations', boothId);
+  if (!booth) { showToast('展位不存在', 'error'); return; }
+  
+  showModal('编辑展位', `
+    <div class="form-grid">
+      <div class="form-group"><label>展位类型</label>
+        <select id="f-boothType" class="form-input">
+          ${['光地展位','独立标准展位','中国区标准展位','联合参展','其他'].map(t => `<option value="${t}" ${booth.boothType===t?'selected':''}>${t}</option>`).join('')}
+        </select></div>
+      <div class="form-group"><label>面积</label><input id="f-area" class="form-input" value="${esc(booth.area)}" /></div>
+      <div class="form-group"><label>展位数量</label><input id="f-boothCount" class="form-input" type="number" value="${booth.boothCount||0}" /></div>
+      <div class="form-group"><label>馆号</label><input id="f-hallNumber" class="form-input" value="${esc(booth.hallNumber)}" /></div>
+      <div class="form-group"><label>展位号</label><input id="f-boothNumber" class="form-input" value="${esc(booth.boothNumber)}" /></div>
+      <div class="form-group"><label>开口</label>
+        <select id="f-openingType" class="form-input">
+          ${['暂未确定','一面开','两面开','三面开','四面开'].map(o => `<option value="${o}" ${booth.openingType===o?'selected':''}>${o}</option>`).join('')}
+        </select></div>
+      <div class="form-group"><label>状态</label>
+        <select id="f-status" class="form-input"><option>待确认</option><option>已确认</option></select></div>
+      <div class="form-group full-width"><label>位置备注</label><textarea id="f-locationNotes" class="form-input" rows="2">${esc(booth.locationNotes)}</textarea></div>
+    </div>
+  `, async (overlay) => {
+    booth.boothType = overlay.querySelector('#f-boothType').value;
+    booth.area = overlay.querySelector('#f-area').value;
+    booth.boothCount = parseInt(overlay.querySelector('#f-boothCount').value) || 0;
+    booth.hallNumber = overlay.querySelector('#f-hallNumber').value.trim();
+    booth.boothNumber = overlay.querySelector('#f-boothNumber').value.trim();
+    booth.openingType = overlay.querySelector('#f-openingType').value;
+    booth.status = overlay.querySelector('#f-status').value;
+    booth.locationNotes = overlay.querySelector('#f-locationNotes').value.trim();
+    booth.updatedAt = now();
+    await put('boothConfirmations', booth);
+    navigateTo('booths');
+  });
+}
+
+// ===== 增租管理 =====
+async function renderRentals() {
+  const members = await getAll('projectMembers');
+  const companies = await getAll('companies');
+  
+  let allRentals = [];
+  members.forEach(m => {
+    (m.rentals || []).forEach(r => {
+      allRentals.push({ ...r, companyId: m.companyId, projectId: m.projectId, memberId: m.id });
+    });
+  });
+  
+  let html = `<div class="panel">
+    <div class="panel-header"><h2>➕ 增租管理 (${allRentals.length} 条)</h2></div>
+    <div class="table-container">`;
+  
+  if (allRentals.length === 0) {
+    html += '<p class="text-muted text-center p-4">暂无增租记录。请在项目企业档案中添加。</p>';
+  } else {
+    html += `<table class="data-table">
+      <thead><tr><th>企业</th><th>类别</th><th>规格</th><th>数量</th><th>单价</th><th>总金额</th><th>已收</th><th>未收</th><th>状态</th></tr></thead>
+      <tbody>`;
+    allRentals.forEach(r => {
+      const c = companies.find(co => String(co.id) === String(r.companyId));
+      html += `<tr>
+        <td>${esc(c ? c.companyCn : '')}</td><td>${esc(r.category)}</td><td>${esc(r.spec)}</td><td>${r.quantity}</td>
+        <td>¥${fmt(r.unitPrice)}</td><td>¥${fmt(r.totalPrice)}</td>
+        <td>¥${fmt(r.paidAmount)}</td><td>¥${fmt((r.totalPrice||0)-(r.paidAmount||0))}</td>
+        <td><span class="badge">${esc(r.paymentStatus||'未收款')}</span></td></tr>`;
+    });
+    html += '</tbody></table>';
+  }
+  
+  html += '</div></div>';
+  return html;
+}
+
+// ===== 随团管理 =====
+async function renderGroupTravel() {
+  const members = await getAll('projectMembers');
+  const companies = await getAll('companies');
+  
+  const groupMembers = members.filter(m => m.isGroupTour || (m.groupTravel && m.groupTravel.count > 0));
+  
+  let html = `<div class="panel">
+    <div class="panel-header"><h2>✈ 随团管理 (${groupMembers.length} 家)</h2></div>
+    <div class="table-container">`;
+  
+  if (groupMembers.length === 0) {
+    html += '<p class="text-muted text-center p-4">暂无随团记录。</p>';
+  } else {
+    html += `<table class="data-table">
+      <thead><tr><th>企业</th><th>人数</th><th>人员</th><th>护照</th><th>签证</th><th>机票</th><th>酒店</th><th>总费用</th><th>已收</th></tr></thead>
+      <tbody>`;
+    groupMembers.forEach(m => {
+      const c = companies.find(co => String(co.id) === String(m.companyId));
+      const gt = m.groupTravel || {};
+      html += `<tr>
+        <td>${esc(c ? c.companyCn : '')}</td><td>${gt.count||0}</td>
+        <td>${esc(gt.participants||'-')}</td>
+        <td><span class="badge badge-${gt.passport?'success':'default'}">${gt.passport?'已提交':'未提交'}</span></td>
+        <td><span class="badge badge-${gt.visa?'success':'default'}">${gt.visa?'已提交':'未提交'}</span></td>
+        <td><span class="badge badge-${gt.flight?'success':'default'}">${gt.flight?'已提交':'未提交'}</span></td>
+        <td><span class="badge badge-${gt.hotel?'info':'default'}">${gt.hotel?'已订':'未订'}</span></td>
+        <td>¥${fmt(gt.totalCost)}</td><td>¥${fmt(gt.paidAmount)}</td></tr>`;
+    });
+    html += '</tbody></table>';
+  }
+  
+  html += '</div></div>';
+  return html;
+}
+
+// ===== 补贴资料 =====
+async function renderSubsidy() {
+  const members = await getAll('projectMembers');
+  const companies = await getAll('companies');
+  const projects = await getAll('projects');
+  
+  const subsidyMembers = members.filter(m => m.subsidyEnabled);
+  
+  let html = `<div class="panel">
+    <div class="panel-header"><h2>📑 补贴资料管理 (${subsidyMembers.length} 家)</h2></div>
+    <div class="table-container">
+      <table class="data-table">
+        <thead><tr><th>企业</th><th>项目</th><th>补贴状态</th><th>资料完成</th><th>操作</th></tr></thead>
+        <tbody>`;
+  
+  subsidyMembers.forEach(m => {
+    const c = companies.find(co => String(co.id) === String(m.companyId));
+    const p = projects.find(pr => String(pr.id) === String(m.projectId));
+    const materials = m.subsidyMaterials || {};
+    const totalItems = Object.keys(materials).length;
+    const completedItems = Object.values(materials).filter(v => v.status === '已通过' || v.status === '不适用').length;
+    const missingItems = Object.values(materials).filter(v => v.status === '未提交' || v.status === '需补充').length;
+    
+    html += `<tr>
+      <td>${esc(c ? c.companyCn : '')}</td>
+      <td>${esc(p ? p.name : '')}</td>
+      <td>${totalItems > 0 ? (missingItems === 0 ? '✅ 全部完成' : `⚠ 缺${missingItems}项`) : '未设置'}</td>
+      <td>${completedItems}/${totalItems}</td>
+      <td><button class="btn btn-xs" onclick="editSubsidy('${m.id}')">管理资料</button></td>
+    </tr>`;
+  });
+  
+  if (subsidyMembers.length === 0) {
+    html += '<tr><td colspan="6" class="text-muted text-center">暂无企业申请补贴</td></tr>';
+  }
+  
+  html += '</tbody></table></div></div>';
+  return html;
+}
+
+// ===== 数据备份中心 =====
+async function renderBackup() {
+  const stats = await getDataStats();
+  
+  let html = `<div class="panel">
+    <div class="panel-header"><h2>💾 数据备份中心</h2></div>
+    <div class="panel-body">`;
+  
+  html += `<h3>当前数据统计</h3>
+    <div class="stats-grid mb-4">
+      ${Object.entries(stats).filter(([k]) => k !== 'attachments').map(([k, v]) => `
+        <div class="stat-card small"><div class="stat-value">${v}</div><div class="stat-label">${k}</div></div>
+      `).join('')}
+    </div>
+    
+    <div class="backup-actions">
+      <button class="btn btn-primary btn-lg" onclick="exportBackup()">📥 导出完整备份</button>
+      <button class="btn btn-lg" onclick="importBackup()">📤 导入/恢复备份</button>
+      <button class="btn btn-lg" onclick="exportCompaniesCSV()">📄 导出企业库CSV</button>
+    </div>
+    
+    <div class="mt-4">
+      <h4>备份说明</h4>
+      <ul class="info-list">
+        <li>备份包含所有企业、项目、合同、付款、展位、跟进等完整数据</li>
+        <li>导出的文件为 JSON 格式，包含备份时间和版本信息</li>
+        <li>建议每次重大更新前进行完整备份</li>
+        <li>恢复操作将覆盖当前数据，请谨慎操作</li>
+      </ul>
+    </div>`;
+  
+  html += '</div></div>';
+  return html;
+}
+
+async function exportBackup() {
+  try {
+    const data = await exportAllData();
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `新丝路会展平台_备份_${new Date().toISOString().split('T')[0]}_${new Date().toTimeString().split(' ')[0].replace(/:/g,'')}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast('备份导出成功！', 'success');
+  } catch(e) {
+    showToast('备份导出失败: ' + e.message, 'error');
+  }
+}
+
+async function exportCompaniesCSV() {
+  const companies = await getAll('companies');
+  const headers = ['id','companyCn','company','contactName','phone','email','website','province','city','stage','priority','owner','contactSource','notes'];
+  const rows = companies.map(c => headers.map(h => `"${String(c[h]||'').replace(/"/g,'""')}"`).join(','));
+  const csv = ['\uFEFF' + headers.join(','), ...rows].join('\n');
+  
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `企业库_${new Date().toISOString().split('T')[0]}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast('企业库导出成功', 'success');
+}
+
+async function importBackup() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.json';
+  input.onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    
+    if (!confirm('⚠️ 恢复操作将覆盖当前所有数据！\n\n请确认已备份当前数据。\n\n此操作不可撤销，确定要恢复吗？')) return;
+    
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      await importAllData(data, true);
+      showToast('数据恢复成功！页面将重新加载。', 'success');
+      setTimeout(() => location.reload(), 1500);
+    } catch(err) {
+      showToast('数据恢复失败: ' + err.message, 'error');
+    }
+  };
+  input.click();
+}
+
+// ===== 系统设置 =====
+function showSettings() {
+  const content = document.getElementById('content-area');
+  if (!content) return;
+  
+  content.innerHTML = `<div class="panel">
+    <div class="panel-header"><h2>⚙ 系统设置</h2></div>
+    <div class="panel-body">
+      <div class="detail-grid">
+        <div class="detail-item"><label>系统名称</label><span>新丝路会展运营管理平台</span></div>
+        <div class="detail-item"><label>公司名称</label><span>深圳市新丝路会展服务有限公司</span></div>
+        <div class="detail-item"><label>统一社会信用代码</label><span>91440300MA5EHE0P4H</span></div>
+        <div class="detail-item"><label>注册地址</label><span>深圳市南山区沙河街道光华街社区深南大道9002号锦绣花园二期C栋6A</span></div>
+        <div class="detail-item"><label>银行</label><span>中信银行深圳南山支行</span></div>
+        <div class="detail-item"><label>银行账号</label><span>8110301012400257945</span></div>
+        <div class="detail-item"><label>数据库版本</label><span>V9 / Schema ${DB_VERSION}</span></div>
+        <div class="detail-item"><label>存储引擎</label><span>IndexedDB (浏览器本地持久化)</span></div>
+      </div>
+      <div class="mt-4">
+        <button class="btn btn-danger" onclick="if(confirm('⚠️ 确定要清空所有数据？此操作不可撤销！')){clearAllData()}">🗑 清空所有数据</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+async function clearAllData() {
+  for (const name of Object.keys(STORES)) {
+    await clearStore(name);
+  }
+  showToast('所有数据已清空', 'warning');
+  setTimeout(() => location.reload(), 1000);
+}
+
+// ===== 导入面板 =====
+function showImportPanel() {
+  const root = document.getElementById('app-root');
+  root.innerHTML = `
+    <div class="import-panel">
+      <div class="import-card">
+        <div class="logo-big">NSR</div>
+        <h1>新丝路会展运营管理平台</h1>
+        <p>V9 | Schema ${DB_VERSION}</p>
+        <p class="text-muted">首次使用，请导入V9备份CSV数据或开始空白系统</p>
+        <div class="import-actions">
+          <button class="btn btn-primary btn-lg" onclick="triggerFileImport()">📂 选择CSV文件导入</button>
+          <button class="btn btn-lg" onclick="tryServerImport()">🌐 从服务器导入</button>
+          <button class="btn btn-lg" onclick="startEmptySystem()">✨ 开始空白系统</button>
+        </div>
+        <p class="text-xs text-muted mt-2">"选择CSV文件导入"：请选择备份目录中的所有13个CSV文件（可多选）</p>
+        <p class="text-xs text-muted">备份目录: data/backup_v9_20260719/csv/</p>
+        <input type="file" id="csv-file-input" multiple accept=".csv" style="display:none" onchange="handleFileImport(event)" />
+        <div id="import-log" class="import-log mt-2"></div>
+      </div>
+    </div>
+  `;
+}
+
+function triggerFileImport() {
+  document.getElementById('csv-file-input').click();
+}
+
+async function handleFileImport(event) {
+  const files = event.target.files;
+  if (!files || files.length === 0) return;
+  
+  const log = document.getElementById('import-log');
+  log.innerHTML = `<p>正在读取 ${files.length} 个文件...</p>`;
+  
+  try {
+    const results = await importFromFiles(files);
+    log.innerHTML = '<h4>导入结果:</h4>' + results.map(r => `<p>${r}</p>`).join('');
+    log.innerHTML += '<p style="color:green;font-weight:bold">✅ 数据导入完成！页面即将刷新...</p>';
+    setTimeout(() => location.reload(), 2000);
+  } catch(e) {
+    log.innerHTML += `<p style="color:red">❌ 导入失败: ${e.message}</p>`;
+  }
+}
+
+async function tryServerImport() {
+  const log = document.getElementById('import-log');
+  log.innerHTML = '<p>正在尝试从服务器导入...</p>';
+  
+  try {
+    const results = await importFromServer();
+    log.innerHTML = '<h4>导入结果:</h4>' + results.map(r => `<p>${r}</p>`).join('');
+    log.innerHTML += '<p style="color:green;font-weight:bold">✅ 数据导入完成！页面即将刷新...</p>';
+    setTimeout(() => location.reload(), 2000);
+  } catch(e) {
+    log.innerHTML += `<p style="color:red">❌ 服务器导入失败: ${e.message}</p>`;
+    log.innerHTML += '<p style="color:orange">💡 请使用"选择CSV文件导入"方式，选择 data/backup_v9_20260719/csv/ 目录中的所有文件</p>';
+  }
+}
+
+async function startEmptySystem() {
+  await clearStore('companies');
+  await clearStore('projects');
+  await clearStore('projectMembers');
+  await clearStore('contracts');
+  await clearStore('paymentRecords');
+  await clearStore('boothConfirmations');
+  await clearStore('receivables');
+  await clearStore('todos');
+  await clearStore('emailLogs');
+  renderApp();
+}
+
+function checkAutoBackup() {
+  const lastBackup = localStorage.getItem('nsr_last_backup');
+  const now = new Date().getTime();
+  if (!lastBackup || (now - parseInt(lastBackup)) > 7 * 24 * 60 * 60 * 1000) {
+    setTimeout(() => {
+      showToast('💡 距上次备份已超过7天，建议前往"数据备份"中心导出备份', 'info');
+    }, 3000);
+  }
+}
+
+</script>
+
+<!-- src/js/app.js -->
+<script>
+/**
+ * 新丝路会展运营管理平台 V9 Stable
+ * 主应用逻辑 - 路由、导航、模块渲染
+ */
+
+// ============ 应用状态 ============
+const AppState = {
+  currentTab: 'dashboard',
+  currentProjectId: null,
+  currentCompanyId: null,
+  modals: {},
+  searchQuery: '',
+  filters: {}
+};
+
+// ============ 初始化 ============
+async function initApp() {
+  try {
+    await openDB();
+    console.log('数据库连接成功');
+    
+    const stats = await getDataStats();
+    const totalRecords = Object.values(stats).reduce((a, b) => a + b, 0);
+    
+    if (totalRecords === 0) {
+      showImportPanel();
+    } else {
+      renderApp();
+    }
+    
+    checkAutoBackup();
+  } catch (err) {
+    console.error('初始化失败:', err);
+    const isVersionError = err.message && (err.message.includes('upgradeneeded') || err.message.includes('VersionError') || err.message.includes('version'));
+    document.getElementById('app-root').innerHTML = `
+      <div class="error-panel" style="text-align:center;padding:60px 20px;max-width:500px;margin:0 auto">
+        <h2 style="color:#ef4444;margin-bottom:12px">系统初始化失败</h2>
+        <p style="color:#64748b;margin-bottom:24px">${err.message || '未知错误'}</p>
+        <div style="display:flex;gap:12px;justify-content:center">
+          <button class="btn btn-primary" onclick="location.reload()">重试</button>
+          ${isVersionError ? `<button class="btn btn-outline" onclick="indexedDB.deleteDatabase('NSR_EOMP').onsuccess=()=>{location.reload()};indexedDB.deleteDatabase('NSR_EOMP').onerror=()=>{location.reload()}">清除数据并重新加载</button>` : ''}
+        </div>
+      </div>`;
+  }
+}
+
+// ============ 主渲染 ============
+function renderApp() {
+  const root = document.getElementById('app-root');
+  root.innerHTML = `
+    <div class="app-container">
+      <nav class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+          <div class="logo">
+            <div class="logo-icon">NS</div>
+            <div>
+              <div class="logo-text">新丝路会展</div>
+              <div class="logo-sub">NEW SILK ROAD EXHIBITION</div>
+            </div>
+          </div>
+        </div>
+        <div class="sidebar-nav" id="sidebar-nav">
+          <div class="nav-section">
+            <div class="nav-section-label">运营</div>
+          </div>
+        </div>
+        <div class="sidebar-bottom">
+          <div class="sidebar-nav-item-tag">
+            <span>项目 · 展位 · 合同 · 收款</span>
+          </div>
+          <div class="sidebar-nav-item-tag" style="margin-top:4px">
+            <span>确保项目全流程高效运营</span>
+          </div>
+        </div>
+      </nav>
+      <main class="main-content" id="main-content">
+        <header class="topbar">
+          <button class="menu-toggle" onclick="toggleSidebar()">☰</button>
+          <div class="topbar-brand">
+            <span class="brand-code">NSR-EOMP</span>
+            <span class="brand-divider"></span>
+            <span class="brand-title">EXHIBITION OPERATIONS</span>
+          </div>
+          <div class="topbar-center">
+            <div class="global-search">
+              <input type="text" id="global-search" placeholder="搜索企业、行业、标签、官网或联系方式" 
+                     onkeydown="if(event.key==='Enter')handleGlobalSearch(event)" />
+            </div>
+          </div>
+          <div class="topbar-actions">
+            <span class="db-status" id="db-status" style="font-size:11px;color:#10b981">● 就绪</span>
+            <div class="user-badge">
+              <div class="user-avatar">唐</div>
+              <div>
+                <div class="user-name">唐静韬</div>
+                <div class="user-role">项目负责人</div>
+              </div>
+            </div>
+          </div>
+        </header>
+        <div class="content-area" id="content-area"></div>
+      </main>
+    </div>
+  `;
+  
+  renderSidebar();
+  navigateTo('dashboard');
+  updateDBStatus();
+}
+
+// ============ 侧边栏 ============
+function renderSidebar() {
+  const nav = document.getElementById('sidebar-nav');
+  const tabs = [
+    { id: 'dashboard', label: '运营中心', icon: '📊' },
+    { id: 'companies', label: '企业库', icon: '🏢' },
+    { id: 'projects', label: '项目中心', icon: '📋' },
+    { id: 'project-members', label: '企业档案', icon: '📁' },
+    { id: 'contracts', label: '合同中心', icon: '📝' },
+    { id: 'payments', label: '付款中心', icon: '💰' },
+    { id: 'booths', label: '展位管理', icon: '🏗' },
+    { id: 'rentals', label: '增租管理', icon: '➕' },
+    { id: 'group-travel', label: '随团管理', icon: '✈' },
+    { id: 'subsidy', label: '补贴资料', icon: '📑' },
+    { id: 'backup', label: '数据备份', icon: '💾' },
+  ];
+  
+  let html = '<div class="nav-section"><div class="nav-section-label">运营</div>';
+  
+  html += tabs.slice(0, 3).map(t => `
+    <div class="nav-item ${AppState.currentTab === t.id ? 'active' : ''}" 
+         onclick="navigateTo('${t.id}')" data-tab="${t.id}">
+      <span class="nav-icon">${t.icon}</span>
+      <span class="nav-label">${t.label}</span>
+    </div>
+  `).join('');
+  
+  html += '</div><div class="nav-section" style="margin-top:8px"><div class="nav-section-label">基础设置</div>';
+  
+  html += tabs.slice(3).map(t => `
+    <div class="nav-item ${AppState.currentTab === t.id ? 'active' : ''}" 
+         onclick="navigateTo('${t.id}')" data-tab="${t.id}">
+      <span class="nav-icon">${t.icon}</span>
+      <span class="nav-label">${t.label}</span>
+    </div>
+  `).join('');
+  
+  html += '</div>';
+  
+  nav.innerHTML = html;
+}
+
+// ============ 导航 ============
+async function navigateTo(tab, params = {}) {
+  AppState.currentTab = tab;
+  
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+  const navItem = document.querySelector(`.nav-item[data-tab="${tab}"]`);
+  if (navItem) navItem.classList.add('active');
+  
+  const content = document.getElementById('content-area');
+  if (!content) return;
+  
+  content.innerHTML = '<div class="loading">正在加载...</div>';
+  
+  try {
+    switch (tab) {
+      case 'dashboard': content.innerHTML = await renderDashboard(); break;
+      case 'companies': content.innerHTML = await renderCompanies(); break;
+      case 'projects': content.innerHTML = await renderProjects(); break;
+      case 'project-members': content.innerHTML = await renderProjectMembers(params); break;
+      case 'contracts': content.innerHTML = await renderContracts(); break;
+      case 'payments': content.innerHTML = await renderPayments(); break;
+      case 'booths': content.innerHTML = await renderBooths(); break;
+      case 'rentals': content.innerHTML = await renderRentals(); break;
+      case 'group-travel': content.innerHTML = await renderGroupTravel(); break;
+      case 'subsidy': content.innerHTML = await renderSubsidy(); break;
+      case 'backup': content.innerHTML = await renderBackup(); break;
+      default: content.innerHTML = '<div class="error-panel"><h2>未知页面</h2></div>';
+    }
+  } catch (err) {
+    console.error(err);
+    content.innerHTML = `<div class="error-panel"><h2>加载失败</h2><p>${err.message}</p><button class="btn btn-primary" onclick="navigateTo('${tab}')">重试</button></div>`;
+  }
+}
+
+// ============ 侧边栏切换 ============
+function toggleSidebar() {
+  document.getElementById('sidebar').classList.toggle('collapsed');
+}
+
+// ============ 全局搜索 ============
+async function handleGlobalSearch(e) {
+  const query = e.target.value.trim();
+  if (!query) return;
+  
+  AppState.searchQuery = query;
+  
+  const results = [];
+  const companies = await getAll('companies');
+  const matchedCompanies = companies.filter(c => 
+    (c.companyCn && c.companyCn.toLowerCase().includes(query.toLowerCase())) ||
+    (c.company && c.company.toLowerCase().includes(query.toLowerCase())) ||
+    (c.contactName && c.contactName.toLowerCase().includes(query.toLowerCase())) ||
+    (c.phone && c.phone.includes(query)) ||
+    (c.email && c.email.toLowerCase().includes(query)) ||
+    (c.website && c.website.toLowerCase().includes(query))
+  );
+  
+  const contracts = await getAll('contracts');
+  const matchedContracts = contracts.filter(c => c.contractNumber && c.contractNumber.toLowerCase().includes(query.toLowerCase()));
+  
+  const booths = await getAll('boothConfirmations');
+  const matchedBooths = booths.filter(b => b.boothNumber && b.boothNumber.toLowerCase().includes(query.toLowerCase()));
+  
+  const allResults = { companies: matchedCompanies.slice(0, 10), contracts: matchedContracts.slice(0, 10), booths: matchedBooths.slice(0, 10) };
+  
+  showSearchResults(query, allResults);
+}
+
+function showSearchResults(query, results) {
+  let html = `<div class="card">
+    <div class="card-header"><h2>搜索结果: "${esc(query)}"</h2>
+    <button class="btn btn-ghost btn-sm" onclick="navigateTo('${AppState.currentTab}')">✕ 关闭</button></div>
+    <div class="card-body">`;
+  
+  if (results.companies.length > 0) {
+    html += `<h3 style="font-size:13px;font-weight:600;margin-bottom:12px">🏢 企业 (${results.companies.length})</h3>
+      <div class="table-container"><table class="data-table">
+      <thead><tr><th>中文名</th><th>英文名</th><th>联系人</th><th>电话</th><th>操作</th></tr></thead><tbody>`;
+    results.companies.forEach(c => {
+      html += `<tr><td><strong>${esc(c.companyCn)}</strong></td><td class="text-sm">${esc(c.company)}</td><td>${esc(c.contactName)}</td><td>${esc(c.phone)}</td>
+        <td><button class="btn btn-sm btn-primary" onclick="navigateTo('project-members',{companyId:'${c.id}'})">查看档案</button></td></tr>`;
+    });
+    html += '</tbody></table></div>';
+  }
+  
+  if (results.contracts.length > 0) {
+    html += `<h3 style="font-size:13px;font-weight:600;margin:16px 0 12px">📝 合同 (${results.contracts.length})</h3>
+      <div class="table-container"><table class="data-table">
+      <thead><tr><th>合同编号</th><th>状态</th><th>金额</th></tr></thead><tbody>`;
+    results.contracts.forEach(c => {
+      html += `<tr><td><strong>${esc(c.contractNumber)}</strong></td><td><span class="badge badge-${getContractStatusClass(c.status)}">${esc(c.status)}</span></td><td>¥${fmt(c.totalAmount)}</td></tr>`;
+    });
+    html += '</tbody></table></div>';
+  }
+  
+  if (results.booths.length > 0) {
+    html += `<h3 style="font-size:13px;font-weight:600;margin:16px 0 12px">🏗 展位 (${results.booths.length})</h3>
+      <div class="table-container"><table class="data-table">
+      <thead><tr><th>展位号</th><th>类型</th><th>状态</th></tr></thead><tbody>`;
+    results.booths.forEach(b => {
+      html += `<tr><td><strong>${esc(b.boothNumber)}</strong></td><td>${esc(b.boothType)}</td><td><span class="badge">${esc(b.status)}</span></td></tr>`;
+    });
+    html += '</tbody></table></div>';
+  }
+  
+  if (results.companies.length === 0 && results.contracts.length === 0 && results.booths.length === 0) {
+    html += '<div class="empty-state"><div class="empty-icon">🔍</div><div class="empty-title">未找到匹配结果</div><div class="empty-desc">尝试搜索企业名称、联系人、合同编号或展位号</div></div>';
+  }
+  
+  html += '</div></div>';
+  document.getElementById('content-area').innerHTML = html;
+}
+
+// ============ 工具函数 ============
+function esc(str) {
+  if (!str) return '';
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function fmt(num, decimals = 2) {
+  if (num === undefined || num === null || num === '') return '0.00';
+  const n = Number(num);
+  if (isNaN(n)) return String(num);
+  return n.toLocaleString('zh-CN', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+}
+
+function fmtInt(num) {
+  if (num === undefined || num === null || num === '') return '0';
+  const n = Number(num);
+  if (isNaN(n)) return String(num);
+  return Math.round(n).toLocaleString('zh-CN');
+}
+
+function fmtDate(dateStr) {
+  if (!dateStr) return '';
+  try {
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return dateStr;
+    return d.toISOString().split('T')[0];
+  } catch(e) { return dateStr; }
+}
+
+function now() { return new Date().toISOString(); }
+function generateId() { return String(Date.now()) + Math.random().toString(36).substr(2, 6); }
+
+async function generateContractNumber(projectId) {
+  const project = await getById('projects', projectId);
+  if (!project) return '';
+  const year = project.year || new Date().getFullYear();
+  const abbr = project.englishName ? project.englishName.replace(/[^A-Z]/g, '').substring(0, 6) : 'PROJ';
+  if (!abbr || abbr.length < 2) { throw new Error('请先在项目设置中填写英文名称缩写'); }
+  const contracts = await getAll('contracts');
+  const existing = contracts.filter(c => c.projectId === projectId && c.contractNumber);
+  const maxSeq = existing.reduce((max, c) => {
+    const parts = c.contractNumber.split('-');
+    const seq = parseInt(parts[parts.length - 1]) || 0;
+    return Math.max(max, seq);
+  }, 0);
+  const seq = String(maxSeq + 1).padStart(3, '0');
+  return `NSR-${year}-${abbr}-${seq}`;
+}
+
+function amountToChinese(num) {
+  if (!num || num === 0) return '零元整';
+  const units = ['', '拾', '佰', '仟', '万', '拾', '佰', '仟', '亿'];
+  const digits = ['零', '壹', '贰', '叁', '肆', '伍', '陆', '柒', '捌', '玖'];
+  let n = Math.abs(Math.round(Number(num) * 100));
+  if (n === 0) return '零元整';
+  let yuan = Math.floor(n / 100), jiao = Math.floor((n % 100) / 10), fen = n % 10;
+  function convertYuan(num) {
+    if (num === 0) return '零';
+    let s = '', i = 0, prevZero = false;
+    while (num > 0) {
+      let d = num % 10;
+      if (d === 0) { if (!prevZero && s !== '') prevZero = true; }
+      else { if (prevZero) { s = '零' + s; prevZero = false; } s = digits[d] + units[i] + s; }
+      num = Math.floor(num / 10); i++;
+    }
+    return s.replace(/零$/, '');
+  }
+  let result = convertYuan(yuan) + '元';
+  if (jiao > 0) result += digits[jiao] + '角';
+  if (fen > 0) result += digits[fen] + '分';
+  else if (jiao === 0) result += '整';
+  return result;
+}
+
+async function updateDBStatus() {
+  const el = document.getElementById('db-status');
+  if (!el) return;
+  try {
+    const stats = await getDataStats();
+    const total = Object.values(stats).reduce((a, b) => a + b, 0);
+    el.innerHTML = `● 就绪 (${total}条)`;
+  } catch(e) { el.innerHTML = '● 离线'; }
+}
+
+function showToast(msg, type = 'info') {
+  let container = document.getElementById('toast-container');
+  if (!container) { container = document.createElement('div'); container.id = 'toast-container'; document.body.appendChild(container); }
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${type}`;
+  toast.textContent = msg;
+  container.appendChild(toast);
+  setTimeout(() => toast.remove(), 3000);
+}
+
+function showModal(title, content, onSave, size = 'medium') {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal modal-${size}">
+      <div class="modal-header">
+        <h2>${title}</h2>
+        <div class="modal-actions">
+          <button class="btn btn-icon" onclick="this.closest('.modal-overlay').remove()">✕</button>
+        </div>
+      </div>
+      <div class="modal-body">${content}</div>
+      <div class="modal-footer">
+        <button class="btn btn-outline" onclick="this.closest('.modal-overlay').remove()">取消</button>
+        <button class="btn btn-primary" id="modal-save-btn">保存</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+  document.getElementById('modal-save-btn').addEventListener('click', async () => {
+    try { await onSave(overlay); overlay.remove(); showToast('保存成功', 'success'); }
+    catch(err) { showToast('保存失败: ' + err.message, 'error'); }
+  });
+}
+
+async function openCompanyDetail(companyId, projectId = null) {
+  const company = await getById('companies', companyId);
+  if (!company) { showToast('企业不存在', 'error'); return; }
+  let member = null;
+  if (projectId) {
+    const members = await getByIndex('projectMembers', 'companyId', companyId);
+    member = members.find(m => m.projectId === projectId);
+  }
+  
+  let html = `<div class="card">
+    <div class="card-header">
+      <h2>${esc(company.companyCn)}</h2>
+      <div class="panel-actions">
+        <button class="btn btn-sm btn-primary" onclick="editCompany('${companyId}')">编辑</button>
+        <button class="btn btn-sm btn-outline" onclick="navigateTo('${AppState.currentTab}')">返回</button>
+      </div>
+    </div>
+    <div class="card-body">`;
+  
+  html += `<div class="detail-grid">
+    <div class="detail-item"><label>中文名称</label><span>${esc(company.companyCn)}</span></div>
+    <div class="detail-item"><label>英文名称</label><span class="text-sm">${esc(company.company)}</span></div>
+    <div class="detail-item"><label>联系人</label><span>${esc(company.contactName)}</span></div>
+    <div class="detail-item"><label>电话</label><span>${esc(company.phone || company.contactPhone)}</span></div>
+    <div class="detail-item"><label>邮箱</label><span class="text-sm">${esc(company.email || company.contactEmail)}</span></div>
+    <div class="detail-item"><label>地区</label><span>${esc(company.province || '')} ${esc(company.city || '')}</span></div>
+    <div class="detail-item"><label>阶段</label><span><span class="badge badge-default">${esc(company.stage || '未设置')}</span></span></div>
+    <div class="detail-item"><label>优先级</label><span><span class="badge badge-${company.priority==='高'?'danger':company.priority==='中'?'warning':'default'}">${esc(company.priority || '-')}</span></span></div>
+    <div class="detail-item"><label>业务归属</label><span>${esc(company.owner || '-')}</span></div>
+    <div class="detail-item"><label>官网</label><span class="text-sm">${esc(company.website)}</span></div>
+    <div class="detail-item"><label>地址</label><span class="text-sm">${esc(company.officialAddress)}</span></div>
+    <div class="detail-item"><label>备注</label><span class="text-sm">${esc(company.notes)}</span></div>
+  </div>`;
+  
+  if (member) {
+    html += `<div class="mt-4"><h3 style="font-size:14px;font-weight:600;margin-bottom:12px">📁 项目业务档案</h3>
+    <div class="detail-grid">
+      <div class="detail-item"><label>意向类型</label><span>${esc(member.intentionType)}</span></div>
+      <div class="detail-item"><label>意向面积</label><span>${member.intendedArea || '-'} ㎡</span></div>
+      <div class="detail-item"><label>业务归属</label><span>${esc(member.businessOwner || member.owner)}</span></div>
+      <div class="detail-item"><label>合同状态</label><span><span class="badge badge-${getContractStatusClass(member.contractStatus)}">${esc(member.contractStatus||'未签订')}</span></span></div>
+      <div class="detail-item"><label>付款状态</label><span><span class="badge badge-${getPaymentStatusClass(member.paymentStatus)}">${esc(member.paymentStatus||'未收款')}</span></span></div>
+      <div class="detail-item"><label>展位类型</label><span>${esc(member.boothType || '-')}</span></div>
+      <div class="detail-item"><label>是否跟团</label><span>${member.isGroupTour ? '✅' : '❌'}</span></div>
+      <div class="detail-item"><label>是否申请补贴</label><span>${member.subsidyEnabled ? '✅' : '❌'}</span></div>
+    </div>
+    
+    <h4 style="font-size:13px;font-weight:600;margin:16px 0 12px">📝 跟进记录 (${(member.followUps || []).length})</h4>
+    <div class="timeline">${(member.followUps || []).map(f => `
+      <div class="timeline-item">
+        <div class="timeline-date">${fmtDate(f.date)}</div>
+        <div class="timeline-content">
+          <div class="timeline-meta">${esc(f.method || '')} | ${esc(f.person || '')}</div>
+          <p>${esc(f.content)}</p>
+          ${f.nextDate ? `<small>下次跟进: ${fmtDate(f.nextDate)}</small>` : ''}
+        </div>
+      </div>
+    `).join('')}${(member.followUps || []).length === 0 ? '<p class="text-muted">暂无跟进记录</p>' : ''}</div>`;
+  }
+  
+  html += '</div></div>';
+  document.getElementById('content-area').innerHTML = html;
+}
+
+function getContractStatusClass(status) {
+  switch(status) { case '已签订': case '履行中': case '已完成': return 'success'; case '已发送': case '待回签': return 'info'; case '草稿': case '待确认': return 'warning'; case '已取消': case '已作废': return 'danger'; default: return 'default'; }
+}
+function getPaymentStatusClass(status) {
+  switch(status) { case '已收全款': return 'success'; case '部分收款': return 'info'; case '未收款': return 'default'; case '多收款': return 'warning'; case '已退款': return 'danger'; default: return 'default'; }
+}
+
+</script>
 
 <script>
 // 初始化
