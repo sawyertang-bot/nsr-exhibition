@@ -31,7 +31,16 @@ async function initApp() {
     checkAutoBackup();
   } catch (err) {
     console.error('初始化失败:', err);
-    document.getElementById('app-root').innerHTML = `<div class="error-panel"><h2>系统初始化失败</h2><p>${err.message}</p><button class="btn btn-primary" onclick="location.reload()">重试</button></div>`;
+    const isVersionError = err.message && (err.message.includes('upgradeneeded') || err.message.includes('VersionError') || err.message.includes('version'));
+    document.getElementById('app-root').innerHTML = `
+      <div class="error-panel" style="text-align:center;padding:60px 20px;max-width:500px;margin:0 auto">
+        <h2 style="color:#ef4444;margin-bottom:12px">系统初始化失败</h2>
+        <p style="color:#64748b;margin-bottom:24px">${err.message || '未知错误'}</p>
+        <div style="display:flex;gap:12px;justify-content:center">
+          <button class="btn btn-primary" onclick="location.reload()">重试</button>
+          ${isVersionError ? `<button class="btn btn-outline" onclick="indexedDB.deleteDatabase('NSR_EOMP').onsuccess=()=>{location.reload()};indexedDB.deleteDatabase('NSR_EOMP').onerror=()=>{location.reload()}">清除数据并重新加载</button>` : ''}
+        </div>
+      </div>`;
   }
 }
 

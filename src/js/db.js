@@ -5,7 +5,7 @@
  */
 
 const DB_NAME = 'NSR_EOMP';
-const DB_VERSION = 16;
+const DB_VERSION = 17; // 递增版本以强制刷新 schema
 
 const STORES = {
   companies: { keyPath: 'id', indexes: ['companyCn', 'company', 'province', 'city', 'stage', 'priority', 'owner'] },
@@ -28,20 +28,52 @@ let db = null;
 function openDB() {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
-    request.onerror = () => reject(request.error);
+
+    request.onerror = () => {
+      const err = request.error;
+      console.error('IndexedDB open error:', err);
+      if (err && err.name === 'VersionError') {
+        reject(new Error('数据库版本冲突，请清除浏览器数据后重试'));
+      } else {
+        reject(err);
+      }
+    };
+
+    request.onblocked = () => {
+      reject(new Error('数据库被其他标签页阻塞，请关闭其他标签页后重试'));
+    };
+
     request.onsuccess = () => {
       db = request.result;
+      db.onerror = (e) => console.error('IndexedDB runtime error:', e.target.error);
       resolve(db);
     };
+
     request.onupgradeneeded = (e) => {
-      const db = e.target.result;
-      for (const [name, config] of Object.entries(STORES)) {
-        if (!db.objectStoreNames.contains(name)) {
-          const store = db.createObjectStore(name, { keyPath: config.keyPath, autoIncrement: name === 'id' ? false : undefined });
-          for (const idx of config.indexes) {
-            store.createIndex(`by_${idx}`, idx, { unique: false });
+      try {
+        const db = e.target.result;
+        const transaction = e.target.transaction;
+
+        // 如果存在旧 schema 不兼容的 store，先清理
+        const existingStores = Array.from(db.objectStoreNames);
+        const expectedStores = Object.keys(STORES);
+        for (const storeName of existingStores) {
+          if (!expectedStores.includes(storeName)) {
+            try { db.deleteObjectStore(storeName); } catch (_) {}
           }
         }
+
+        for (const [name, config] of Object.entries(STORES)) {
+          if (!db.objectStoreNames.contains(name)) {
+            const store = db.createObjectStore(name, { keyPath: config.keyPath });
+            for (const idx of config.indexes) {
+              store.createIndex(`by_${idx}`, idx, { unique: false });
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Upgradeneeded error:', err);
+        throw err;
       }
     };
   });
