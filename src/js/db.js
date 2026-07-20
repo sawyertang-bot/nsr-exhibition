@@ -52,17 +52,17 @@ function openDB() {
     request.onupgradeneeded = (e) => {
       try {
         const db = e.target.result;
-        const transaction = e.target.transaction;
+        const oldVersion = e.oldVersion;
 
-        // 如果存在旧 schema 不兼容的 store，先清理
-        const existingStores = Array.from(db.objectStoreNames);
-        const expectedStores = Object.keys(STORES);
-        for (const storeName of existingStores) {
-          if (!expectedStores.includes(storeName)) {
+        // 版本升级时彻底重建所有 store，确保 schema 一致
+        if (oldVersion < DB_VERSION) {
+          const existingStores = Array.from(db.objectStoreNames);
+          for (const storeName of existingStores) {
             try { db.deleteObjectStore(storeName); } catch (_) {}
           }
         }
 
+        // 创建所有 store
         for (const [name, config] of Object.entries(STORES)) {
           if (!db.objectStoreNames.contains(name)) {
             const store = db.createObjectStore(name, { keyPath: config.keyPath });
